@@ -13,7 +13,7 @@
 
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
-import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { isTopLevelAgent, type AgentManager } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
@@ -65,7 +65,7 @@ export interface FleetWorkflow {
 }
 
 type MainEntry = { kind: "main" };
-type AgentEntry = { kind: "agent"; record: AgentRecord };
+type AgentEntry = { kind: "agent"; record: AgentRecord; depth: number; isLast: boolean; ancestorBranches: boolean[] };
 type WorkflowEntry = { kind: "workflow"; workflow: FleetWorkflow };
 type FleetEntry = MainEntry | WorkflowEntry | AgentEntry;
 
@@ -242,6 +242,10 @@ export class FleetList {
    * viewed, plus recently-finished ones (they linger briefly before dropping out).
    * Pending agents with no session yet are hidden until they start.
    * (`listAgents()` is newest-first, so we re-sort.)
+   *
+   * Nested agents are included for visual hierarchy but rendered indented.
+   * They are not selectable — pressing Enter on a parent with a focused child
+   * opens the parent; stepping into a child is not supported.
    */
   private agentRecords(): AgentRecord[] {
     const now = Date.now();
@@ -284,15 +288,70 @@ export class FleetList {
   }
 
   /**
-   * Runs sit above the agents rather than interleaved by start time: a run owns
-   * most of the agents under it, so listing the container first is what makes
-   * the list read as a hierarchy rather than a shuffle.
+   * Runs sit above the agents, followed by agents in tree order (depth-first).
+   * Nested agents are placed after their parent so the list reads as a hierarchy.
+   * Uses the tree algorithm: each ancestor level contributes "│ " or "  " (2 chars),
+   * the current level contributes "├─" or "└─" (2 chars). Total prefix = depth * 2.
    */
   private roster(): FleetEntry[] {
+    const childrenByParent = new Map<string, AgentRecord[]>();
+    const topLevels: AgentRecord[] = [];
+
+    for (const a of this.agentRecords()) {
+      if (a.parentAgentId == null) {
+        topLevels.push(a);
+      } else {
+        if (!childrenByParent.has(a.parentAgentId)) {
+          childrenByParent.set(a.parentAgentId, []);
+        }
+        childrenByParent.get(a.parentAgentId)!.push(a);
+      }
+    }
+
+    // Sort each group by start time
+    topLevels.sort((a, b) => a.startedAt - b.startedAt);
+    for (const children of childrenByParent.values()) {
+      children.sort((a, b) => a.startedAt - b.startedAt);
+    }
+
+    const entries: FleetEntry[] = [];
+
+    // Walk DFS, tracking ancestorBranches: true = ancestor was last child (spaces),
+    // false = ancestor has siblings below (│)
+    const walk = (parentId: string | null, ancestorBranches: boolean[]): void => {
+      const children = parentId === null ? topLevels : (childrenByParent.get(parentId) || []);
+      for (const child of children) {
+        const isLast = child === children[children.length - 1];
+        const depth = ancestorBranches.length + 1;
+        entries.push({
+          kind: "agent" as const,
+          record: child,
+          depth,
+          isLast,
+          ancestorBranches: [...ancestorBranches, isLast],
+        });
+        walk(child.id, [...ancestorBranches, isLast]);
+      }
+    };
+
+    // First, walk top-level agents
+    for (let i = 0; i < topLevels.length; i++) {
+      const top = topLevels[i];
+      const isLast = top === topLevels[topLevels.length - 1];
+      entries.push({
+        kind: "agent" as const,
+        record: top,
+        depth: 0,
+        isLast,
+        ancestorBranches: [],
+      });
+      walk(top.id, [isLast]);
+    }
+
     return [
       { kind: "main" },
-      ...this.workflows().map(workflow => ({ kind: "workflow" as const, workflow })),
-      ...this.agentRecords().map(record => ({ kind: "agent" as const, record })),
+      ...this.workflows().map(w => ({ kind: "workflow" as const, workflow: w })),
+      ...entries,
     ];
   }
 
@@ -397,6 +456,10 @@ export class FleetList {
       );
       return;
     }
+    // Nested agents are not selectable — just move on to the next row
+    if (entry.depth > 0) {
+      return;
+    }
     const record = entry.record;
     if (!this.ui) return;
     if (!record.session) {
@@ -484,7 +547,7 @@ export class FleetList {
       lines.push(
         row.kind === "workflow" ?
           this.renderWorkflowRow(a + 1, sel, row.workflow, width, theme)
-        : this.renderAgentRow(a + 1, sel, row.record, width, theme),
+        : this.renderAgentRow(a + 1, sel, row.record, width, theme, row.depth, row.isLast, row.ancestorBranches),
       );
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
@@ -519,17 +582,41 @@ export class FleetList {
     return rightAlign(left, selected ? theme.fg("text", stats) : theme.fg("dim", stats), width);
   }
 
-  private renderAgentRow(rosterIndex: number, sel: number, record: AgentRecord, width: number, theme: Theme): string {
+  private renderAgentRow(
+    rosterIndex: number,
+    sel: number,
+    record: AgentRecord,
+    width: number,
+    theme: Theme,
+    depth: number,
+    isLast: boolean,
+    ancestorBranches: boolean[],
+  ): string {
     // The selected row renders in the theme's primary text color so it reads as
     // one selection (#230). A configured badge survives — Claude Code's FleetView
     // keeps the agent color on the selected row too and only bolds it — which also
     // keeps the row's width fixed as the selection moves.
     const selected = rosterIndex === sel;
+
+    // Tree algorithm prefix:
+    // Each ancestor: ancestorBranches[i] ? "  " (spaces) : "│ " (branch) = 2 chars
+    // Current: "└─" or "├─" = 2 chars
+    // Total prefix = depth * 2 chars
+    let prefix = "";
+    for (let i = 0; i < ancestorBranches.length; i++) {
+      prefix += ancestorBranches[i] ? "  " : "│ ";
+    }
+    prefix += isLast ? "└─" : "├─";
+
     const name = renderAgentName(record.type, theme, selected
       ? { fallbackColor: "text", bold: hasAgentBadge(record.type) }
       : { fallbackColor: "muted" });
     const description = selected ? theme.fg("text", record.description) : record.description;
-    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}  ${description}`;
+    // Top-level agents: "  " indent. Nested: prefix already includes indentation.
+    const indent = depth === 0 ? "  " : "";
+    // Dim the bullet for nested agents to indicate non-selectable
+    const bulletChar = depth > 0 ? theme.fg("dim", "○") : this.bullet(rosterIndex, sel, theme);
+    const left = `${indent}${prefix}${bulletChar} ${name}  ${description}`;
     // The record, not the activity tracker — see the note in AgentWidget's
     // running line: only the record carries a nested child's spend, and only it
     // outlives the agent.

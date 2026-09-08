@@ -7,9 +7,9 @@
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
-import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { isTopLevelAgent, type AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
-import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
+import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
@@ -304,11 +304,15 @@ export class AgentWidget {
    *   - `all`: every agent.
    */
   private widgetAgents() {
-    const all = this.manager.listAgents().filter(isTopLevelAgent);
+    const all = this.manager.listAgents();
     switch (this.mode()) {
       case "off": return [];
-      case "background": return all.filter(a => a.isBackground !== false);
-      default: return all;
+      case "background":
+        return all.filter(
+          a => isTopLevelAgent(a) && a.isBackground !== false,
+        );
+      default:
+        return all.filter(isTopLevelAgent);
     }
   }
 
@@ -413,21 +417,54 @@ export class AgentWidget {
   /**
    * Render the widget content. Called from the registered widget's render() callback,
    * reading live state each time instead of capturing it in a closure.
+   * Builds a tree from agent records and renders it linearly with proper indentation.
    */
   private renderWidget(tui: any, theme: Theme): string[] {
     const allAgents = this.widgetAgents();
-    const running = allAgents.filter(a => a.status === "running");
-    const queued = allAgents.filter(a => a.status === "queued");
-    const finished = allAgents.filter(a =>
-      a.status !== "running" && a.status !== "queued" && a.completedAt
-      && this.shouldShowFinished(a.id, a.status),
-    );
 
-    const hasActive = running.length > 0 || queued.length > 0;
-    const hasFinished = finished.length > 0;
+    if (allAgents.length === 0) return [];
 
-    // Nothing to show — return empty (widget will be unregistered by update())
-    if (!hasActive && !hasFinished) return [];
+    // Build tree: group children by parent
+    const childrenByParent = new Map<string, AgentRecord[]>();
+    const topLevels: AgentRecord[] = [];
+
+    for (const a of allAgents) {
+      if (a.parentAgentId == null) {
+        topLevels.push(a);
+      } else {
+        if (!childrenByParent.has(a.parentAgentId)) {
+          childrenByParent.set(a.parentAgentId, []);
+        }
+        childrenByParent.get(a.parentAgentId)!.push(a);
+      }
+    }
+
+    // Sort each group by start time
+    topLevels.sort((a, b) => a.startedAt - b.startedAt);
+    for (const children of childrenByParent.values()) {
+      children.sort((a, b) => a.startedAt - b.startedAt);
+    }
+
+    // Helper: count visible lines for an agent and all its descendants
+    const lineCount = (a: AgentRecord): number => {
+      const selfLines = a.status === "running" ? 2 : 1;
+      const childLines = (childrenByParent.get(a.id) || []).reduce((sum, c) => sum + lineCount(c), 0);
+      return selfLines + childLines;
+    };
+
+    // Helper: check if an agent should be visible
+    const isVisible = (a: AgentRecord): boolean => {
+      if (a.status === "running") return true;
+      if (a.status === "queued") return true;
+      if (a.completedAt && this.shouldShowFinished(a.id, a.status)) return true;
+      if (a.status === "error" || a.status === "aborted" || a.status === "stopped") return true;
+      return false;
+    };
+
+    // Check active
+    const hasActive = allAgents.some(a => a.status === "running" || a.status === "queued");
+    const hasVisible = allAgents.some(a => isVisible(a));
+    if (!hasActive && !hasVisible) return [];
 
     const w = tui.terminal.columns;
     const truncate = (line: string) => truncateToWidth(line, w);
@@ -435,137 +472,109 @@ export class AgentWidget {
     const headingIcon = hasActive ? "●" : "○";
     const frame = SPINNER[this.widgetFrame % SPINNER.length];
 
-    // Build sections separately for overflow-aware assembly.
-    // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
+    const lines: string[] = [];
+    lines.push(truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents")));
 
-    const finishedLines: string[] = [];
-    for (const a of finished) {
-      finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme)));
-    }
+    // Budget: heading (1 line) + overflow indicator (1 line) = 2 reserved
+    const maxBody = MAX_WIDGET_LINES - 1;
+    let budget = maxBody;
+    let hiddenCount = 0;
 
-    const runningLines: string[][] = []; // each entry is [header, activity]
-    for (const a of running) {
-      const modeLabel = getPromptModeLabel(a.type);
-      const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-      const elapsed = formatMs(Date.now() - a.startedAt);
+    // Walk the tree recursively, collecting lines
+    const walk = (parentId: string | null, isParentLast: boolean, indent: string): void => {
+      if (budget <= 0) return;
 
-      const bg = this.agentActivity.get(a.id);
-      const toolUses = bg?.toolUses ?? a.toolUses;
-      // Spend comes from the record, never from the activity tracker: the record
-      // is the one that survives the agent finishing, and the one nested-tools
-      // folds a hidden child's spend into. Reading the tracker while an agent
-      // runs and the record once it stops made the figure jump at completion.
-      const tokens = getLifetimeTotal(a.lifetimeUsage);
-      const contextPercent = getSessionContextPercent(bg?.session);
-      const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
-      const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
+      const children = parentId === null ? topLevels : (childrenByParent.get(parentId) || []);
+      if (children.length === 0) return;
 
-      const parts: string[] = [];
-      if (this.showModel()) {
-        // Leading, and paired: a thinking level means nothing without the model
-        // it applies to. The tag is taken from buildInvocationTags rather than
-        // rebuilt so the "(asked X)" annotation survives.
-        const { modelName, tags } = buildInvocationTags(a.invocation);
-        if (modelName) parts.push(modelName);
-        const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
-        if (thinkingTag) parts.push(thinkingTag);
-      }
-      if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
-      if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
-      if (tokenText) parts.push(tokenText);
-      if (costText) parts.push(costText);
-      parts.push(elapsed);
-      const statsText = parts.join(" · ");
+      for (let i = 0; i < children.length && budget > 0; i++) {
+        const child = children[i];
+        const isLast = (i === children.length - 1);
+        const childTotal = lineCount(child);
 
-      const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
+        if (budget < childTotal) {
+          hiddenCount += childTotal;
+          break;
+        }
 
-      runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
-        truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
-      ]);
-    }
+        budget -= childTotal;
+        hiddenCount = hiddenCount; // no change yet
 
-    const queuedLine = queued.length > 0
-      ? truncate(theme.fg("dim", "├─") + ` ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)
-      : undefined;
+        // Determine connector
+        const connector = isLast ? "└─ " : "├─ ";
+        const branchChar = isLast ? "   " : "│  ";
+        const childIndent = indent + (isParentLast ? "    " : "│   ");
 
-    // Assemble with overflow cap (heading + overflow indicator = 2 reserved lines).
-    const maxBody = MAX_WIDGET_LINES - 1; // heading takes 1 line
-    const totalBody = finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
+        if (child.status === "running") {
+          // Running agent: 2 lines (header + activity)
+          const modeLabel = getPromptModeLabel(child.type);
+          const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
+          const elapsed = formatMs(Date.now() - child.startedAt);
 
-    const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"))];
+          const bg = this.agentActivity.get(child.id);
+          const toolUses = bg?.toolUses ?? child.toolUses;
+          const tokens = getLifetimeTotal(child.lifetimeUsage);
+          const contextPercent = getSessionContextPercent(bg?.session);
+          const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, child.compactionCount) : "";
+          const costText = this.showCost() ? formatCost(getLifetimeCost(child.lifetimeUsage)) : "";
 
-    if (totalBody <= maxBody) {
-      // Everything fits — add all lines and fix up connectors for the last item.
-      lines.push(...finishedLines);
-      for (const pair of runningLines) lines.push(...pair);
-      if (queuedLine) lines.push(queuedLine);
-
-      // Fix last connector: swap ├─ → └─ and │ → space for activity lines.
-      if (lines.length > 1) {
-        const last = lines.length - 1;
-        lines[last] = lines[last].replace("├─", "└─");
-        // If last item is a running agent activity line, fix indent of that line
-        // and fix the header line above it.
-        if (runningLines.length > 0 && !queuedLine) {
-          // The last two lines are the last running agent's header + activity.
-          if (last >= 2) {
-            lines[last - 1] = lines[last - 1].replace("├─", "└─");
-            lines[last] = lines[last].replace("│  ", "   ");
+          const parts: string[] = [];
+          if (this.showModel()) {
+            const { modelName, tags } = buildInvocationTags(child.invocation);
+            if (modelName) parts.push(modelName);
+            const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
+            if (thinkingTag) parts.push(thinkingTag);
           }
-        }
-      }
-    } else {
-      // Overflow — prioritize: running > queued > finished.
-      // Reserve 1 line for overflow indicator.
-      let budget = maxBody - 1;
-      let hiddenRunning = 0;
-      let hiddenFinished = 0;
+          if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
+          if (toolUses > 0) parts.push(`${child.toolUses} tool use${child.toolUses === 1 ? "" : "s"}`);
+          if (tokenText) parts.push(tokenText);
+          if (costText) parts.push(costText);
+          parts.push(elapsed);
+          const statsText = parts.join(" · ");
 
-      // Reserve the queued line's row up front. It is a single summary of N
-      // waiting agents, so it cannot be folded into the "+N more" count (which
-      // is denominated in agents) without either under-reporting it as 1 or
-      // inflating the total with agents that were never getting their own rows.
-      // Reserving costs at most one running agent — which IS counted below —
-      // and makes the drop unreachable. It matters most exactly when it used to
-      // vanish: the pool is saturated and the queue is what the user needs to see.
-      const queuedReserve = queuedLine ? 1 : 0;
-      budget -= queuedReserve;
+          const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
-      // 1. Running agents (2 lines each)
-      for (const pair of runningLines) {
-        if (budget >= 2) {
-          lines.push(...pair);
-          budget -= 2;
+          lines.push(truncate(
+            theme.fg("dim", indent + connector) + ` ${theme.fg("accent", frame)} ${renderAgentName(child.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", child.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`
+          ));
+          lines.push(truncate(
+            theme.fg("dim", childIndent + branchChar) + `  ⎿  ${activity}`
+          ));
         } else {
-          hiddenRunning++;
+          // Finished/error/etc: 1 line
+          lines.push(truncate(
+            theme.fg("dim", indent + connector) + " " + this.renderFinishedLine(child, theme)
+          ));
+        }
+
+        // Recurse into children
+        walk(child.id, isLast, childIndent);
+      }
+    };
+
+    walk(null, true, "");
+
+    // Recalculate hiddenCount: total potential body lines minus rendered body lines.
+    // The walk only counts the first overflowed child, so we fix it here.
+    const totalPotentialLines = topLevels.reduce((sum, a) => sum + lineCount(a), 0);
+    const renderedBodyLines = lines.length - 1; // subtract heading
+    hiddenCount = totalPotentialLines - renderedBodyLines;
+
+    // Add overflow indicator if agents were hidden
+    if (hiddenCount > 0) {
+      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hiddenCount} more`)}`));
+    }
+
+    // Fix last connector: swap ├─ → └─
+    if (lines.length > 1) {
+      const last = lines.length - 1;
+      lines[last] = lines[last].replace("├─", "└─");
+      // If last item is a running agent activity line, fix the pipe above it
+      if (lines[last].includes("⎿")) {
+        if (last >= 2) {
+          lines[last - 1] = lines[last - 1].replace("│  ", "   ");
         }
       }
-
-      // 2. Queued line (always fits — its row was reserved above)
-      if (queuedLine) {
-        budget += queuedReserve;
-        lines.push(queuedLine);
-        budget--;
-      }
-
-      // 3. Finished agents
-      for (const fl of finishedLines) {
-        if (budget >= 1) {
-          lines.push(fl);
-          budget--;
-        } else {
-          hiddenFinished++;
-        }
-      }
-
-      // Overflow summary
-      const overflowParts: string[] = [];
-      if (hiddenRunning > 0) overflowParts.push(`${hiddenRunning} running`);
-      if (hiddenFinished > 0) overflowParts.push(`${hiddenFinished} finished`);
-      const overflowText = overflowParts.join(", ");
-      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hiddenRunning + hiddenFinished} more (${overflowText})`)}`)
-      );
     }
 
     return lines;

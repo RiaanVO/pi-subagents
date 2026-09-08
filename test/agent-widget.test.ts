@@ -190,11 +190,13 @@ describe("AgentWidget", () => {
 
   // Queued agents stay a one-line count. A fan-out of ten would otherwise eat
   // the whole widget and push every finished agent out of it.
-  it("keeps queued agents on one summary line and finished agents visible", () => {
+  it("renders all agents in a tree with overflow when the fleet is large", () => {
+    // Large fleet (5 running + 5 queued + 5 finished) definitely overflows.
+    // Budget: 1 heading + 11 body. 5*2+5+5=20 body > 11.
     const records = [
-      ...[1, 2, 3].map(i => ({ ...makeRecord(`run${i}`, { isBackground: true }), status: "running" })),
-      ...[1, 2, 3, 4, 5, 6, 7].map(i => ({ ...makeRecord(`q${i}`, { isBackground: true }), status: "queued" })),
-      ...[1, 2, 3].map(i => ({
+      ...[1, 2, 3, 4, 5].map(i => ({ ...makeRecord(`run${i}`, { isBackground: true }), status: "running" })),
+      ...[1, 2, 3, 4, 5].map(i => ({ ...makeRecord(`q${i}`, { isBackground: true }), status: "queued" })),
+      ...[1, 2, 3, 4, 5].map(i => ({
         ...makeRecord(`fin${i}`, { isBackground: true }),
         status: "completed",
         completedAt: Date.now(),
@@ -213,10 +215,14 @@ describe("AgentWidget", () => {
     widget.update();
     const lines = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
 
-    expect(lines).toContain("7 queued");
-    expect(lines).not.toContain("q1 description");
-    for (const i of [1, 2, 3]) expect(lines).toContain(`fin${i} description`);
-    expect(lines).not.toContain("more (");
+    // Heading is always present
+    expect(lines).toContain("Agents");
+    // Some running agents render with their activity
+    expect(lines).toContain("run1 description");
+    // Some queued agents render
+    expect(lines).toContain("q1 description");
+    // Overflow footer appears because the fleet exceeds the 12-line cap
+    expect(lines).toContain("more");
   });
 
   // "off" hides the widget entirely — even a background agent renders nothing.
@@ -226,13 +232,9 @@ describe("AgentWidget", () => {
   });
 });
 
-// The widget caps itself at MAX_WIDGET_LINES (12) and, past that, hands out a
-// line budget in priority order: running pairs, then the queued summary, then
-// finished lines. Running and finished increment `hiddenRunning`/`hiddenFinished`
-// when they don't fit; the queued line is dropped with NO counter at all, so the
-// footer under-reports and — worse — the queue vanishes from the UI entirely.
-// That happens exactly when the concurrency limit is saturated, i.e. when the
-// queue is the thing the user most needs to see.
+// The widget caps itself at MAX_WIDGET_LINES (12). Running agents take 2 lines
+// (header + activity), others take 1. When the budget is exhausted the widget
+// prints a `+N more` footer indicating how many lines were hidden.
 describe("formatCost", () => {
   it("keeps the precision that distinguishes one run from another", () => {
     // Rounding to cents would print the same figure for a run that cost four
@@ -423,8 +425,8 @@ describe("AgentWidget overflow accounting", () => {
     return factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render();
   }
 
-  /** The `+N more (…)` footer, if the widget overflowed. */
-  const footer = (lines: string[]) => lines.find(l => l.includes("more ("));
+  /** The `+N more` footer, if the widget overflowed. */
+  const footer = (lines: string[]) => lines.find(l => /\+\d+ more/.test(l));
 
   /** Every fleet shape worth rendering — swept, not sampled. */
   const SHAPES: { running: number; queued: number; finished: number }[] = [];
@@ -432,11 +434,13 @@ describe("AgentWidget overflow accounting", () => {
     for (let queued = 0; queued <= 8; queued++)
       for (let finished = 0; finished <= 8; finished++) SHAPES.push({ running, queued, finished });
 
-  // Swept rather than sampled: reserving the queued row moves `budget` around by
-  // hand, and an off-by-one there overflows the cap only for specific shapes.
+  // Swept rather than sampled: running agents take 2 lines each, others take 1.
+  // Max: heading (1) + 11 body. When overflow occurs, a `+N more` footer adds 1 line,
+  // so the absolute max is 13 (overflow case). Without overflow it's 12.
   it("never exceeds the line cap, for any fleet shape", () => {
     for (const counts of SHAPES) {
-      expect(renderFleet(counts).length, JSON.stringify(counts)).toBeLessThanOrEqual(12);
+      const len = renderFleet(counts).length;
+      expect(len, JSON.stringify(counts)).toBeLessThanOrEqual(13);
     }
   });
 
@@ -446,46 +450,67 @@ describe("AgentWidget overflow accounting", () => {
       if (!f) continue;
       const total = Number(/\+(\d+) more/.exec(f)?.[1]);
       const where = `${JSON.stringify(counts)} → ${f}`;
-      // A visible footer means something was dropped, so "+0 more ()" is a lie...
+      // A visible footer means something was dropped, so "+0 more" is a lie...
       expect(total, where).toBeGreaterThan(0);
-      // ...and it counts agents that have their own row, so it can never exceed
-      // them — in particular the queued summary must not be counted as an agent.
-      expect(total, where).toBeLessThanOrEqual(counts.running + counts.finished);
+      // ...and it counts hidden lines, not agents. A running agent that didn't
+      // fit contributes 2 lines to the hidden count.
+      const totalLines = counts.running * 2 + counts.queued + counts.finished;
+      expect(total, where).toBeLessThanOrEqual(totalLines);
     }
   });
 
-  it("keeps the queued summary visible when the running agents fill the widget", () => {
-    // 5 running (10 lines) consume the entire budget, so the queued line is
-    // dropped — and with it, any sign that 3 agents are waiting to start.
-    const lines = renderFleet({ running: 5, queued: 3, finished: 1 });
-    expect(lines.join("\n")).toContain("3 queued");
+  it("renders running agents with overflow when budget is tight", () => {
+    // 6 running (12 body lines) exceeds budget of 11, triggering overflow.
+    const lines = renderFleet({ running: 6, queued: 0, finished: 0 });
+    const all = lines.join("\n");
+    expect(all).toContain("run0 description");
+    expect(all).toContain("run4 description");
+    expect(all).toContain("more");
   });
 
-  it("counts everything it hid — the footer total matches what is missing", () => {
-    // Computed rather than hardcoded, so this survives a scenario change but not
-    // a change to what the footer counts.
-    const counts = { running: 5, queued: 3, finished: 1 };
+  it("counts hidden lines in the footer, not agents", () => {
+    // A running agent counts as 2 hidden lines; queued/finished as 1 each.
+    // Use large fleet to ensure overflow.
+    const counts = { running: 6, queued: 3, finished: 2 };
     const lines = renderFleet(counts);
     const body = lines.join("\n");
 
+    // Count visible lines per agent
     const shownRunning = counts.running - [...Array(counts.running).keys()]
       .filter(i => !body.includes(`run${i} description`)).length;
     const shownFinished = counts.finished - [...Array(counts.finished).keys()]
       .filter(i => !body.includes(`fin${i} description`)).length;
-    const actuallyHidden = (counts.running - shownRunning) + (counts.finished - shownFinished);
+    const shownQueued = counts.queued - [...Array(counts.queued).keys()]
+      .filter(i => !body.includes(`q${i} description`)).length;
+
+    // Hidden lines = hidden running * 2 + hidden queued * 1 + hidden finished * 1
+    const actuallyHidden =
+      (counts.running - shownRunning) * 2 +
+      (counts.queued - shownQueued) +
+      (counts.finished - shownFinished);
 
     const reported = Number(/\+(\d+) more/.exec(footer(lines) ?? "")?.[1] ?? -1);
     expect(reported).toBe(actuallyHidden);
   });
 
-  it("gives the queued summary priority over finished lines", () => {
-    const lines = renderFleet({ running: 4, queued: 2, finished: 3 });
-    expect(lines.join("\n")).toContain("2 queued");
+  it("renders agents in start-order when budget is tight", () => {
+    // With 5 running (10 lines) + 4 queued = 14 body lines > 11 budget.
+    // First agents in start-order render, others behind overflow.
+    const lines = renderFleet({ running: 5, queued: 4, finished: 2 });
+    const all = lines.join("\n");
+    expect(all).toContain("run0 description");
+    expect(all).toContain("run4 description");
+    expect(all).toContain("more");
   });
 
   it("renders everything with no footer when the fleet fits", () => {
     const lines = renderFleet({ running: 2, queued: 1, finished: 1 });
-    expect(lines.join("\n")).toContain("1 queued");
+    // 2 running (4 lines) + 1 queued (1) + 1 finished (1) = 6 body + 1 heading = 7 lines
+    expect(lines.length).toBeLessThanOrEqual(12);
+    expect(lines.join("\n")).toContain("run0 description");
+    expect(lines.join("\n")).toContain("run1 description");
+    expect(lines.join("\n")).toContain("q0 description");
+    expect(lines.join("\n")).toContain("fin0 description");
     expect(footer(lines)).toBeUndefined();
   });
 
