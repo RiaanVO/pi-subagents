@@ -15,7 +15,14 @@
  * agents bypass the pool, so the limit only started applying to ordinary
  * parallel work once background became the default.
  */
-import { describe, expect, it, vi } from "vitest";
+// Force in-process transport (tests don't support UDS; override global settings).
+import { afterEach, describe, expect, it, vi } from "vitest";
+vi.mock("../src/settings.js", () => ({
+  loadSettings: () => ({}),
+  applySettings: () => {},
+  applyAndEmitLoaded: () => ({}),
+  saveSettings: () => true,
+}));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -117,3 +124,96 @@ describe("backgroundByDefault", () => {
     for (const out of outs) expect(out).not.toContain("queued");
   });
 });
+
+// ── UDS-path variants ───────────────────────────────────────────────────
+
+/** Hoisted mocks for UDS agent runner. */
+const mockRunViaUds = vi.hoisted(() => vi.fn());
+const mockCleanupUdsAgent = vi.hoisted(() => vi.fn());
+const mockSteerUdsAgent = vi.hoisted(() => vi.fn());
+const mockAbortUdsAgent = vi.hoisted(() => vi.fn());
+
+vi.mock("../src/uds-agent-runner.js", () => ({
+  runViaUds: mockRunViaUds,
+  cleanupUdsAgent: mockCleanupUdsAgent,
+  steerUdsAgent: mockSteerUdsAgent,
+  abortUdsAgent: mockAbortUdsAgent,
+}));
+
+/** Hoisted mocks for child_process and net — prevent real processes. */
+const mockChildFork = vi.hoisted(() => vi.fn());
+const mockNetCreateConnection = vi.hoisted(() => vi.fn());
+
+vi.mock("node:child_process", () => ({
+  fork: mockChildFork,
+}));
+
+vi.mock("node:net", () => ({
+  createConnection: mockNetCreateConnection,
+}));
+
+describe("with transport 'uds' (UDS path)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+  });
+
+  function settledUds(responseText: string) {
+    const mockClient = { destroy: vi.fn(), writable: true } as any;
+    const writeMock = vi.fn();
+    mockClient.write = writeMock;
+    mockRunViaUds.mockResolvedValue({
+      responseText,
+      session: null as any,
+      aborted: false,
+      steered: false,
+      failure: undefined,
+      client: mockClient,
+      socketPath: "/tmp/test.sock",
+    } as any);
+  }
+
+  function spawnUds(
+    tools: Map<string, any>,
+    params: Record<string, unknown> = {},
+  ) {
+    return tools.get("Agent").execute(
+      "tc",
+      {
+        prompt: "go",
+        description: "d",
+        subagent_type: "general-purpose",
+        transport: "uds",
+        ...params,
+      },
+      undefined,
+      undefined,
+      ctx(),
+    );
+  }
+
+  it("returns an agent ID, not the result, when the call doesn't specify (transport=uds)", async () => {
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    settledUds("THE-PAYLOAD");
+
+    const out = textOf(await spawnUds(tools));
+
+    expect(out).toContain("Agent ID:");
+    // The whole point of backgrounding: the orchestrator does NOT get the
+    // output here — it arrives later as a notification preview.
+    expect(out).not.toContain("THE-PAYLOAD");
+  });
+
+  it("still blocks and returns the output inline when run_in_background is false (transport=uds)", async () => {
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    settledUds("THE-PAYLOAD");
+
+    const out = textOf(await spawnUds(tools, { run_in_background: false }));
+
+    expect(out).toContain("THE-PAYLOAD");
+    expect(out).not.toContain("started in background");
+  });
+});
+

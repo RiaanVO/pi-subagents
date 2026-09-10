@@ -18,6 +18,7 @@ import { AgentManager } from "../src/agent-manager.js";
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
+  DEFAULT_TRANSPORT: "in-process" as const,
 }));
 
 vi.mock("../src/worktree.js", () => ({

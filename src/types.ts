@@ -8,6 +8,9 @@ import type { LifetimeUsage } from "./usage.js";
 
 export type { ThinkingLevel };
 
+/** Transport mechanism for agent execution. */
+export type AgentTransport = "in-process" | "uds";
+
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
 
@@ -238,6 +241,11 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
+  /**
+   * Whether a UDS child was spawned inside a tmux window. Only meaningful when
+   * transport === "uds". Stored so surfaces can render a tmux attachment hint.
+   */
+  tmuxWindow?: string;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */

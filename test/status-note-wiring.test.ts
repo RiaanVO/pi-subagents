@@ -4,7 +4,14 @@
  * a string. Drives the registered `Agent` / `get_subagent_result` tools and
  * inspects the text delivered back, for a turn-limit abort and a user stop.
  */
+// Force in-process transport (tests don't support UDS; override global settings).
 import { afterEach, describe, expect, it, vi } from "vitest";
+vi.mock("../src/settings.js", () => ({
+  loadSettings: () => ({}),
+  applySettings: () => {},
+  applyAndEmitLoaded: () => ({}),
+  saveSettings: () => true,
+}));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -13,6 +20,32 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+
+// ── Hoisted mocks for UDS agent runner ─────────────────────────────────
+
+const mockRunViaUds = vi.hoisted(() => vi.fn());
+const mockCleanupUdsAgent = vi.hoisted(() => vi.fn());
+const mockSteerUdsAgent = vi.hoisted(() => vi.fn());
+const mockAbortUdsAgent = vi.hoisted(() => vi.fn());
+
+vi.mock("../src/uds-agent-runner.js", () => ({
+  runViaUds: mockRunViaUds,
+  cleanupUdsAgent: mockCleanupUdsAgent,
+  steerUdsAgent: mockSteerUdsAgent,
+  abortUdsAgent: mockAbortUdsAgent,
+}));
+
+/** Hoisted mocks for child_process and net — prevent real processes. */
+const mockChildFork = vi.hoisted(() => vi.fn());
+const mockNetCreateConnection = vi.hoisted(() => vi.fn());
+
+vi.mock("node:child_process", () => ({
+  fork: mockChildFork,
+}));
+
+vi.mock("node:net", () => ({
+  createConnection: mockNetCreateConnection,
+}));
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -318,3 +351,225 @@ describe("subagents:compacted", () => {
     expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:compacted", expect.anything());
   });
 });
+
+// ── UDS-path variants ───────────────────────────────────────────────────
+
+describe("status note reaches the parent through the real handlers (UDS path)", () => {
+  afterEach(() => {
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    vi.restoreAllMocks();
+  });
+
+  it("foreground turn-limit abort → the Agent result flags an incomplete outcome (transport=uds)", async () => {
+    const mockClient = { destroy: vi.fn(), writable: true } as any;
+    const writeMock = vi.fn();
+    mockClient.write = writeMock;
+    const socketPath = "/tmp/test.sock";
+    mockRunViaUds.mockImplementation(async (_ctx: any, _type: any, _prompt: any, options: any) => {
+      options.onClientConnected?.(mockClient, socketPath);
+      return {
+        responseText: "partial work so far",
+        session: null as any,
+        aborted: true, // hard turn-limit abort
+        steered: false,
+        failure: undefined,
+        client: mockClient,
+        socketPath,
+      } as any;
+    });
+
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+
+    const res = await tools.get("Agent").execute(
+      "tc1",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: false, transport: "uds" },
+      undefined, undefined, ctx(),
+    );
+
+    const out = textOf(res);
+    expect(out).toContain("aborted at the turn limit");
+    expect(out).toContain("partial work so far");
+    expect(out).not.toContain("STOPPED BY THE USER");
+
+    expect(out).toContain("everything the agent produced is above");
+    expect(out).toContain("the task is unfinished");
+    expect(out).not.toContain("re-spawn");
+    expect(out).not.toContain("get_subagent_result");
+  });
+
+  it("foreground user-stop → tells the parent NOT to restart it (transport=uds)", async () => {
+    const mockClient = { destroy: vi.fn(), writable: true } as any;
+    mockClient.write = vi.fn();
+    const socketPath = "/tmp/test.sock";
+    let resolveRun: ((v: any) => void) | undefined;
+    mockRunViaUds.mockImplementation(
+      (_ctx: any, _type: any, _prompt: any, options: any) => {
+        options.onClientConnected?.(mockClient, socketPath);
+        return new Promise((resolve) => {
+          resolveRun = () => resolve({
+            responseText: "partial work so far",
+            session: null as any,
+            aborted: false,
+            steered: false,
+            failure: undefined,
+            client: mockClient,
+            socketPath,
+          } as any);
+        });
+      },
+    );
+
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+
+    const parent = new AbortController();
+    const call = tools.get("Agent").execute(
+      "tc-stop",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: false, transport: "uds" },
+      parent.signal, undefined, ctx(),
+    );
+
+    await new Promise((r) => setImmediate(r));
+    parent.abort(); // the user hits ESC
+    resolveRun?.({
+      responseText: "partial work so far",
+      session: null as any,
+      aborted: false,
+      steered: false,
+      failure: undefined,
+    });
+
+    const out = textOf(await call);
+    expect(out).toContain("STOPPED BY THE USER");
+    expect(out).toContain("everything the agent produced is above");
+    expect(out).toContain("the task is unfinished");
+    expect(out).not.toContain("re-spawn");
+    expect(out).not.toContain("ask before");
+  });
+
+  it("background user-stop → get_subagent_result flags STOPPED BY THE USER (transport=uds)", async () => {
+    // A background agent that never settles on its own — only a stop ends it.
+    mockRunViaUds.mockReturnValue(new Promise(() => {}) as any);
+    const { pi, tools, eventHandlers, lifecycle } = makePi();
+    subagentsExtension(pi);
+    await bind(lifecycle);
+
+    const spawn = await tools.get("Agent").execute(
+      "tc2",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: true, transport: "uds" },
+      undefined, undefined, ctx(),
+    );
+    const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
+    expect(id, "background spawn should surface an agent id").toBeTruthy();
+
+    // The user stops it.
+    eventHandlers.get("subagents:rpc:stop")?.({ requestId: "r1", agentId: id });
+
+    const res = await tools.get("get_subagent_result").execute(
+      "tc3", { agent_id: id }, undefined, undefined, ctx(),
+    );
+
+    const out = textOf(res);
+    expect(out).toContain("STOPPED BY THE USER");
+    expect(out).toContain("the task was NOT finished");
+    expect(out).not.toContain("Done");
+    expect(out).not.toContain("everything the agent produced is above");
+  });
+});
+
+describe("subagents:compacted (UDS path)", () => {
+  /** Run an agent via UDS runner and fire compaction through onCompaction callback. */
+  function runWithCompactionUds(info: { reason: string; tokensBefore: number }) {
+    const mockClient = { destroy: vi.fn(), writable: true } as any;
+    const socketPath = "/tmp/test.sock";
+    mockRunViaUds.mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      opts.onClientConnected?.(mockClient, socketPath);
+      opts.onCompaction?.(info);
+      return {
+        responseText: "done",
+        session: null as any,
+        aborted: false,
+        steered: false,
+        failure: undefined,
+        client: mockClient,
+        socketPath,
+      } as any;
+    });
+  }
+
+  it("emits the documented payload when a top-level agent's session compacts (transport=uds)", async () => {
+    runWithCompactionUds({ reason: "threshold", tokensBefore: 12345 });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+
+    await tools.get("Agent").execute(
+      "tc-compact-uds",
+      { prompt: "go", description: "compacting agent", subagent_type: "general-purpose", transport: "uds" },
+      undefined, undefined, ctx(),
+    );
+
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:compacted", expect.objectContaining({
+      id: expect.any(String),
+      type: "general-purpose",
+      description: "compacting agent",
+      reason: "threshold",
+      tokensBefore: 12345,
+      compactionCount: 1,
+    }));
+  });
+
+  it("counts repeated compactions on the same agent (transport=uds)", async () => {
+    const mockClient = { destroy: vi.fn(), writable: true } as any;
+    const socketPath = "/tmp/test.sock";
+    mockRunViaUds.mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      opts.onClientConnected?.(mockClient, socketPath);
+      opts.onCompaction?.({ reason: "overflow", tokensBefore: 1 });
+      opts.onCompaction?.({ reason: "overflow", tokensBefore: 2 });
+      return {
+        responseText: "done",
+        session: null as any,
+        aborted: false,
+        steered: false,
+        failure: undefined,
+        client: mockClient,
+        socketPath,
+      } as any;
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+
+    await tools.get("Agent").execute(
+      "tc-compact2-uds",
+      { prompt: "go", description: "twice", subagent_type: "general-purpose", transport: "uds" },
+      undefined, undefined, ctx(),
+    );
+
+    const counts = pi.events.emit.mock.calls
+      .filter((c: any[]) => c[0] === "subagents:compacted")
+      .map((c: any[]) => c[1].compactionCount);
+    expect(counts).toEqual([1, 2]);
+  });
+
+  it("stays silent for a nested child (transport=uds)", async () => {
+    runWithCompactionUds({ reason: "threshold", tokensBefore: 999 });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+
+    await tools.get("Agent").execute(
+      "tc-parent-uds",
+      { prompt: "go", description: "parent", subagent_type: "general-purpose", transport: "uds" },
+      undefined, undefined, ctx(),
+    );
+    const rawManager = vi.mocked(mockRunViaUds).mock.calls[0][3].nestedRuntime.manager;
+    const parentId = vi.mocked(mockRunViaUds).mock.calls[0][3].nestedRuntime.parentAgentId;
+    pi.events.emit.mockClear();
+
+    rawManager.spawn(pi, ctx(), "general-purpose", "nested",
+      { description: "nested child", isBackground: true, parentAgentId: parentId, depth: 2, maxSubagentDepth: 2 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:compacted", expect.anything());
+  });
+});
+

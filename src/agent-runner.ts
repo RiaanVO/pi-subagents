@@ -27,7 +27,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentTransport, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -311,6 +311,9 @@ export function installExtensionToolScope(
 /** Default max turns. undefined = unlimited (no turn limit). */
 let defaultMaxTurns: number | undefined;
 
+/** Default transport mechanism for agent execution. */
+export const DEFAULT_TRANSPORT: AgentTransport = "in-process";
+
 /** Normalize max turns. undefined or 0 = unlimited, otherwise minimum 1. */
 export function normalizeMaxTurns(n: number | undefined): number | undefined {
   if (n == null || n === 0) return undefined;
@@ -490,6 +493,8 @@ export interface RunOptions {
     depth: number;
     maxSubagentDepth?: number;
   };
+  /** Transport mechanism: "in-process" (default) or "uds" for separate child process. */
+  transport?: AgentTransport;
 }
 
 export interface RunResult {

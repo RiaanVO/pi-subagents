@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 
 vi.mock("../src/agent-runner.js", () => ({
+  DEFAULT_TRANSPORT: "in-process" as const,
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
 }));

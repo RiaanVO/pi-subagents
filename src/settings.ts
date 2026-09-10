@@ -302,6 +302,18 @@ export interface SubagentsSettings {
    * `ViewerMarkdownMode` for the specific rewrites — so `all` is opt-in.
    */
   viewerMarkdown?: ViewerMarkdownMode;
+  /**
+   * Default transport mechanism for subagent spawns. Defaults to `"in-process"`.
+   * Agents can override this with `transport` in the Agent tool call or frontmatter.
+   * - `"in-process"`: runs inline in the parent process (current behavior, default)
+   * - `"uds"`: runs in a separate child process via Unix Domain Sockets
+   */
+  defaultTransport?: "in-process" | "uds";
+  /**
+   * Whether UDS subagents spawn inside tmux windows by default.
+   * Only meaningful when `defaultTransport` is `"uds"`. Defaults to false.
+   */
+  tmuxEnabled?: boolean;
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
@@ -332,6 +344,8 @@ export interface SettingsAppliers {
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
+  setDefaultTransport: (transport: "in-process" | "uds") => void;
+  setTmuxEnabled: (tmuxEnabled: boolean) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -448,6 +462,16 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
     out.viewerMarkdown = r.viewerMarkdown as ViewerMarkdownMode;
   }
+  // defaultTransport — "tmux" is silently downgraded to "uds" (tmux is now a separate flag)
+  if (
+    typeof r.defaultTransport === "string" &&
+    ["in-process", "uds", "tmux"].includes(r.defaultTransport)
+  ) {
+    out.defaultTransport = r.defaultTransport === "tmux" ? "uds" : (r.defaultTransport as "in-process" | "uds");
+  }
+  if (typeof r.tmuxEnabled === "boolean") {
+    out.tmuxEnabled = r.tmuxEnabled;
+  }
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
@@ -536,6 +560,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
+  if (s.defaultTransport) appliers.setDefaultTransport(s.defaultTransport);
+  if (typeof s.tmuxEnabled === "boolean") appliers.setTmuxEnabled(s.tmuxEnabled);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
 }
 

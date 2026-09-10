@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import type { AgentConfig, AgentTransport, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -69,6 +69,7 @@ interface AgentInvocationParams {
    * for the cross-extension RPC path, where options arrive unvalidated.
    */
   isolation?: unknown;
+  transport?: AgentTransport;
 }
 
 interface ResolveOptions {
@@ -91,6 +92,12 @@ interface ResolveOptions {
    * a caller that supplies no options at all, which in-tree means tests.
    */
   defaultRunInBackground?: boolean;
+  /**
+   * Default transport from the subagents settings. Caller-supplied `transport`
+   * overrides everything; frontmatter overrides params; the setting is the
+   * fallback chain: params.transport → defaultTransport → "in-process".
+   */
+  defaultTransport?: "in-process" | "uds";
 }
 
 export function resolveAgentInvocationConfig(
@@ -106,6 +113,7 @@ export function resolveAgentInvocationConfig(
   runInBackground: boolean;
   isolated: boolean;
   isolation?: IsolationMode;
+  transport: AgentTransport;
   /**
    * Caller parameters an agent file's frontmatter outranked, so the surfaces can
    * say "(asked X)" instead of presenting the effective value as the requested
@@ -141,6 +149,7 @@ export function resolveAgentInvocationConfig(
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
     isolation,
+    transport: params.transport ?? (opts?.defaultTransport ?? "in-process"),
     // Undefined rather than an empty object when nothing was overridden: callers
     // spread this into the invocation snapshot, and an always-present key would
     // put `requestedThinking: undefined` on every record.

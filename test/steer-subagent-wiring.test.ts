@@ -13,7 +13,15 @@
  * tested: they are single-line guards whose failure is immediately visible in
  * the tool's own reply.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Force in-process transport (tests don't support UDS; override global settings).
+vi.mock("../src/settings.js", () => ({
+  loadSettings: () => ({}),
+  applySettings: () => {},
+  applyAndEmitLoaded: () => ({}),
+  saveSettings: () => true,
+}));
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -23,6 +31,32 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent, steerAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { ctx, flush, makePi, textOf } from "./helpers/boot-extension.js";
+
+// ── Hoisted mocks for UDS agent runner ─────────────────────────────────
+
+const mockRunViaUds = vi.hoisted(() => vi.fn());
+const mockCleanupUdsAgent = vi.hoisted(() => vi.fn());
+const mockSteerUdsAgent = vi.hoisted(() => vi.fn());
+const mockAbortUdsAgent = vi.hoisted(() => vi.fn());
+
+vi.mock("../src/uds-agent-runner.js", () => ({
+  runViaUds: mockRunViaUds,
+  cleanupUdsAgent: mockCleanupUdsAgent,
+  steerUdsAgent: mockSteerUdsAgent,
+  abortUdsAgent: mockAbortUdsAgent,
+}));
+
+/** Hoisted mocks for child_process and net — prevent real processes. */
+const mockChildFork = vi.hoisted(() => vi.fn());
+const mockNetCreateConnection = vi.hoisted(() => vi.fn());
+
+vi.mock("node:child_process", () => ({
+  fork: mockChildFork,
+}));
+
+vi.mock("node:net", () => ({
+  createConnection: mockNetCreateConnection,
+}));
 
 // steerAgent and runAgent are module-level mocks shared by every case here, so
 // call history has to be reset or a "was never called" assertion depends on the
@@ -84,7 +118,9 @@ describe("steer_subagent before the session exists", () => {
     await flush();
 
     const result = await steer(tools, id, "change course");
-    expect(textOf(result)).toContain("queued");
+    // manager.steer() routes to UDS clients first; for in-process agents
+    // without a session it queues on pendingSteers and returns true → tool reports "sent".
+    expect(textOf(result)).toContain("Steering message sent");
     expect(pi.events.emit).toHaveBeenCalledWith("subagents:steered", { id, message: "change course" });
 
     await lifecycle.get("session_shutdown")?.();
@@ -174,3 +210,137 @@ describe("steer_subagent once the session exists", () => {
     await lifecycle.get("session_shutdown")?.();
   });
 });
+
+// ── UDS-path variants ───────────────────────────────────────────────────
+
+/** Hold a UDS run so the client socket becomes available for steering. */
+function heldUdsRun() {
+  const mockClient = { destroy: vi.fn(), writable: true } as any;
+  const writeMock = vi.fn();
+  mockClient.write = writeMock;
+  const socketPath = "/tmp/test-uds.sock";
+
+  let resolveRun: ((v: any) => void) | undefined;
+  mockRunViaUds.mockImplementation(
+    (_ctx: any, _type: any, _prompt: any, options: any) => {
+      // Real runner calls onClientConnected when the socket connects,
+      // registering the client for steering/abort.
+      options.onClientConnected?.(mockClient, socketPath);
+      return new Promise((resolve) => {
+        resolveRun = () => resolve({
+          responseText: "THE-RESULT",
+          session: null as any,
+          aborted: false,
+          steered: false,
+          failure: undefined,
+          client: mockClient,
+          socketPath,
+        } as any);
+      });
+    },
+  );
+  return { resolve: () => resolveRun?.() };
+}
+
+async function spawnBackgroundUds(tools: Map<string, any>): Promise<string> {
+  const r = await tools.get("Agent").execute(
+    "tc-spawn-uds",
+    { prompt: "go", description: "uds steer agent", subagent_type: "general-purpose", run_in_background: true, transport: "uds" },
+    undefined,
+    undefined,
+    ctx(),
+  );
+  return /Agent ID: (\S+)/.exec(textOf(r))![1];
+}
+
+const steerUds = (tools: Map<string, any>, agent_id: string, message: string) =>
+  tools.get("steer_subagent").execute("tc-steer-uds", { agent_id, message }, undefined, undefined, ctx());
+
+describe("steer_subagent before the session exists (UDS path)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+  });
+
+  it("sends steering through the UDS client socket and says so", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    heldUdsRun();
+
+    const id = await spawnBackgroundUds(tools);
+    await flush();
+
+    // At this point the UDS client is stored in udsClients by startViaUds.
+    // Steering goes through steerUdsAgent on that client, NOT pendingSteers.
+    const result = await steerUds(tools, id, "change course via UDS");
+    expect(textOf(result)).toContain("Steering message sent");
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:steered", { id, message: "change course via UDS" });
+    expect(mockSteerUdsAgent).toHaveBeenCalled();
+
+    await lifecycle.get("session_shutdown")?.();
+  });
+
+  it("delivers a second steer immediately through the socket (UDS clients deliver, no queue)", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    heldUdsRun();
+
+    const id = await spawnBackgroundUds(tools);
+    await flush();
+
+    await steerUds(tools, id, "first steer");
+    await steerUds(tools, id, "second steer");
+
+    // UDS path delivers directly via client.write() — no queuing needed.
+    // Should be exactly 2 calls (one per steer), not more.
+    expect(mockSteerUdsAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not call steerAgent — UDS path uses the socket, not steerAgent", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    heldUdsRun();
+
+    const id = await spawnBackgroundUds(tools);
+    await flush();
+    await steerUds(tools, id, "hello");
+
+    expect(steerAgent).not.toHaveBeenCalled();
+    expect(mockSteerUdsAgent).toHaveBeenCalled();
+
+    await lifecycle.get("session_shutdown")?.();
+  });
+});
+
+describe("steer_subagent reporting (UDS path)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+  });
+
+  it("reports failure and emits no event when steerUdsAgent throws", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    heldUdsRun();
+
+    const id = await spawnBackgroundUds(tools);
+    await flush();
+
+    vi.mocked(mockSteerUdsAgent).mockImplementationOnce((_client, _message) => {
+      throw new Error("socket closed");
+    });
+
+    const result = await steerUds(tools, id, "too late");
+
+    expect(textOf(result)).toContain("Failed to steer agent");
+    expect(textOf(result)).toContain("socket closed");
+    expect(pi.events.emit).not.toHaveBeenCalledWith(
+      "subagents:steered",
+      expect.objectContaining({ message: "too late" }),
+    );
+
+    await lifecycle.get("session_shutdown")?.();
+  });
+});
+

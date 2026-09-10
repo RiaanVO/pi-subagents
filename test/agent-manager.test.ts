@@ -9,6 +9,7 @@ import type { AgentRecord } from "../src/types.js";
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
+  DEFAULT_TRANSPORT: "in-process" as const,
 }));
 
 vi.mock("../src/worktree.js", () => ({
@@ -16,6 +17,26 @@ vi.mock("../src/worktree.js", () => ({
   cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
   pruneWorktrees: vi.fn(),
   isWorktreeIsolationEnabled: vi.fn(() => true),
+}));
+
+// Hoisted mocks for UDS and tmux-workspace (needed by tmuxEnabled tests)
+const mockRunViaUds = vi.hoisted(() => vi.fn());
+const mockCleanupUdsAgent = vi.hoisted(() => vi.fn());
+const mockSteerUdsAgent = vi.hoisted(() => vi.fn());
+const mockAbortUdsAgent = vi.hoisted(() => vi.fn());
+const mockSpawnUdsSubagent = vi.hoisted(() => vi.fn());
+const mockGetSocketPathForWindow = vi.hoisted(() => vi.fn());
+
+vi.mock("../src/uds-agent-runner.js", () => ({
+  runViaUds: mockRunViaUds,
+  cleanupUdsAgent: mockCleanupUdsAgent,
+  steerUdsAgent: mockSteerUdsAgent,
+  abortUdsAgent: mockAbortUdsAgent,
+}));
+
+vi.mock("../src/tmux-workspace.js", () => ({
+  spawnUdsSubagent: mockSpawnUdsSubagent,
+  getSocketPathForWindow: mockGetSocketPathForWindow,
 }));
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
@@ -2505,3 +2526,85 @@ describe("AgentManager — effective model and thinking write-back", () => {
     expect(record.invocation).toEqual({ thinking: "max" });
   });
 });
+
+// ── tmuxEnabled transport tests ──────────────────────────────────────────
+
+describe("tmuxEnabled transport", () => {
+  afterEach(() => {
+    // Each test disposes its own manager instance
+  });
+
+  it("spawns with tmuxEnabled: true calls spawnUdsSubagent for tmux spawn", async () => {
+    vi.clearAllMocks();
+    mockSpawnUdsSubagent.mockReturnValue({
+      windowName: "explore-1",
+      socketPath: "/tmp/sock-test-123",
+    });
+
+    const mgr = new AgentManager(() => {});
+    const id = mgr.spawn(mockPi, mockCtx, "Explore", "test tmux agent", {
+      description: "test tmux agent",
+      isBackground: true,
+      transport: "uds" as any,
+      tmuxEnabled: true,
+    });
+
+    const record = mgr.getRecord(id)!;
+    // Wait a tick for the async spawn to start
+    await new Promise((r) => setImmediate(r));
+
+    // tmuxEnabled=true with transport="uds" routes to startViaTmuxUds
+    // which calls spawnUdsSubagent from tmux-workspace
+    expect(mockSpawnUdsSubagent).toHaveBeenCalled();
+    mgr.dispose();
+  });
+
+  it("tmuxEnabled: true is ignored when transport is 'in-process'", async () => {
+    vi.clearAllMocks();
+    runAgent.mockResolvedValue({
+      responseText: "done",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+    });
+
+    const mgr = new AgentManager(() => {});
+    const id = mgr.spawn(mockPi, mockCtx, "Explore", "test", {
+      description: "test",
+      isBackground: true,
+      transport: "in-process" as any,
+      tmuxEnabled: true,
+    });
+
+    const record = mgr.getRecord(id)!;
+    if (record.promise) await record.promise;
+
+    // In-process path: runAgent should be called, NOT spawnUdsSubagent
+    expect(runAgent).toHaveBeenCalled();
+    expect(mockSpawnUdsSubagent).not.toHaveBeenCalled();
+    mgr.dispose();
+  });
+
+  it("transport: 'uds' with tmuxEnabled: false uses UDS path (not tmux)", async () => {
+    vi.clearAllMocks();
+    // Just verify spawnUdsSubagent is NOT called when tmuxEnabled=false
+    // The actual runViaUds call is tested in uds-agent-runner.test.ts
+    const mgr = new AgentManager(() => {});
+    const id = mgr.spawn(mockPi, mockCtx, "Explore", "test uds", {
+      description: "test uds",
+      isBackground: true,
+      transport: "uds" as any,
+      tmuxEnabled: false,
+    });
+
+    const record = mgr.getRecord(id)!;
+    // Wait a tick for the async spawn to start
+    await new Promise((r) => setImmediate(r));
+
+    // When transport="uds" and tmuxEnabled=false, startViaUds is used (not tmux)
+    // spawnUdsSubagent should NOT be called in this case
+    expect(mockSpawnUdsSubagent).not.toHaveBeenCalled();
+    mgr.dispose();
+  });
+});
+

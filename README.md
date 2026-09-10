@@ -36,6 +36,85 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
+- **Process isolation via UDS** — run agents in separate processes via Unix Domain Sockets. Crashing a subagent doesn't affect the parent. Optionally show each agent in its own tmux window for direct terminal interaction.
+
+## UDS + Tmux Workspace
+
+Run agents as **separate Node.js processes** that communicate with the parent via Unix Domain Sockets (UDS). Add `transport: "uds"` (or `"tmux"`) to any `Agent` call for process isolation — crashing a subagent no longer affects the parent, and each child has its own process memory, event loop, and system prompt.
+
+When `transport: "tmux"` is used (requires tmux installed), each agent gets its own tmux window in the `pi-subagents` session. Window 0 is a dashboard showing all active agents; subsequent windows are named `<type>-<description-slug>`. You can switch to any window and interact directly with that agent's TUI — run commands, browse files, debug — while the parent still controls via the UDS socket (steer, abort, tool scoping). The tmux session is independent: detach with `Ctrl+B D` and the agents keep running.
+
+### How it works
+
+```
+Parent pi session
+  └── Agent({ transport: "uds" })
+        └── Fork: node uds-child.mjs
+              ├── Runs full pi AgentSession in child process
+              ├── Binds UDS socket at ~/.pi/subagents/sockets/sock-<uuid>
+              ├── Streams events to parent (turn_start, text_delta, tool_start, tool_end, message_end, compaction, completed)
+              └── Receives commands from parent (steer, abort, setTools, excludeTools, setThinking, compact)
+```
+
+Socket files live in `~/.pi/subagents/sockets/` and are cleaned up automatically when children exit. Stale sockets (from crashed children) are cleaned up every 30 seconds.
+
+### Usage
+
+Basic UDS agent (separate process, no tmux):
+
+```typescript
+Agent({
+  subagent_type: "Audit",
+  prompt: "Review security vulnerabilities in the auth module",
+  description: "Security review",
+  transport: "uds",
+})
+```
+
+Tmux mode (separate process + tmux window for direct interaction):
+
+```typescript
+Agent({
+  subagent_type: "Explore",
+  prompt: "Map the API surface of this service",
+  description: "API exploration",
+  transport: "tmux",
+})
+```
+
+Tmux mode can also be set in agent frontmatter:
+
+```markdown
+# .pi/agents/auditor.md
+---
+name: Auditor
+transport: tmux          # "uds" or "tmux" (tmux implies uds)
+---
+```
+
+### Transport settings
+
+Three ways to set the transport:
+
+1. **Per-call** — `transport: "uds"` or `"tmux"` in the `Agent` tool parameters
+2. **Per-agent** — `transport: "uds"` in `.pi/agents/<name>.md` frontmatter
+3. **Global default** — `"defaultTransport": "uds"` in `subagents.json`
+
+Omit all three (or set to the default `"in-process"`) for the current inline behavior — no child process, full backward compatibility.
+
+### Steering and resuming
+
+Works exactly the same as in-process agents:
+- **Steering**: `steer_subagent({ agent_id: "abc123", message: "Also check the config files" })` — routed through the UDS socket automatically
+- **Resume**: Open the same session file in a new child process with a new socket; conversation history is restored
+
+### Transport modes
+
+| Mode | Description |
+|------|-------------|
+| `"in-process"` (default) | Runs inline in the same process as the parent (current behavior) |
+| `"uds"` | Runs in a separate child process with UDS communication |
+| `"tmux"` | Runs in a UDS child inside a tmux window (implies UDS) |
 
 ## Install
 
@@ -417,6 +496,7 @@ Launch a sub-agent.
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
+| `transport` | `"in-process"` \| `"uds"` \| `"tmux"` | no | Run in a separate process via Unix Domain Sockets. `"uds"` = process isolation + socket IPC. `"tmux"` = UDS + dedicated tmux window for direct terminal interaction. Default is `"in-process"` (current inline behavior).
 
 ### `SubagentWorkflow`
 

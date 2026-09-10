@@ -36,7 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTransport, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -432,6 +432,22 @@ export default function (pi: ExtensionAPI) {
   let viewerMarkdown: ViewerMarkdownMode = "assistant";
   function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
   function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
+  /**
+   * Default transport mechanism for subagent spawns. Resolved via getter so
+   * the Agent tool handler reads the live value, not a stale snapshot.
+   */
+  let defaultTransport: "in-process" | "uds" = "in-process";
+  function getDefaultTransport(): "in-process" | "uds" { return defaultTransport; }
+  function setDefaultTransport(t: "in-process" | "uds"): void {
+    defaultTransport = t;
+  }
+  /**
+   * Whether UDS subagents spawn inside tmux windows. Resolved via getter so
+   * changes apply live. Only meaningful when transport is "uds".
+   */
+  let tmuxEnabled = false;
+  function isTmuxEnabled(): boolean { return tmuxEnabled; }
+  function setTmuxEnabled(v: boolean): void { tmuxEnabled = v; }
   /**
    * The viewer's `m` key, from either entry point: set the mode and persist it,
    * so the key and `/agents → Settings` stay one setting rather than one per
@@ -1426,6 +1442,8 @@ export default function (pi: ExtensionAPI) {
       setShowCost,
       setShowModel,
       setViewerMarkdown,
+      setDefaultTransport,
+      setTmuxEnabled,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -1642,6 +1660,16 @@ Terse command-style prompts produce shallow, generic work.
           description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
         }),
       ),
+      transport: Type.Optional(
+        Type.String({
+          description: "Transport mechanism: 'in-process' (default, runs inline in the same process) or 'uds' (runs in a separate child process with its own session, connected via Unix Domain Socket).",
+        }),
+      ),
+      tmux_enabled: Type.Optional(
+        Type.Boolean({
+          description: "Run the agent in a tmux window (only when transport is 'uds'). Defaults to false. Tmux provides a visible terminal window for direct interaction with the agent.",
+        }),
+      ),
       ...isolationParam(isWorktreeIsolationEnabled()),
       ...scheduleParam,
     }),
@@ -1802,9 +1830,13 @@ Terse command-style prompts produce shallow, generic work.
       // Get agent config (if any)
       const customConfig = getAgentConfig(subagentType);
 
-      const resolvedConfig = resolveAgentInvocationConfig(customConfig, params, {
+      const resolvedConfig = resolveAgentInvocationConfig(customConfig, {
+        ...params,
+        transport: params.transport as import("./types.js").AgentTransport | undefined,
+      }, {
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: getBackgroundByDefault(),
+        defaultTransport: getDefaultTransport(),
       });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
@@ -1838,6 +1870,8 @@ Terse command-style prompts produce shallow, generic work.
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
+      const transport = resolvedConfig.transport;
+      const tmuxEnabled = params.tmux_enabled ?? (isTmuxEnabled() && transport === "uds");
       // Whether this spawn writes its .output transcript. Per-agent
       // frontmatter (`output_transcript`) wins; otherwise the project/global
       // default applies. `attachTranscript` below is the SOLE gate — every
@@ -2062,6 +2096,8 @@ Terse command-style prompts produce shallow, generic work.
           thinkingLevel: thinking,
           isBackground: true,
           isolation,
+          transport,
+          tmuxEnabled,
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
           ...bgCallbacks,
@@ -2215,6 +2251,7 @@ Terse command-style prompts produce shallow, generic work.
           inheritContext,
           thinkingLevel: thinking,
           isolation,
+          transport,
           invocation: agentInvocation,
           signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
@@ -2842,7 +2879,17 @@ Terse command-style prompts produce shallow, generic work.
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
       if (!record.session) {
-        // Session not ready yet — queue the steer for delivery once initialized
+        // Try manager.steer() first — it routes to UDS agents directly.
+        // Only queue if there's no UDS client and no session (session initializing).
+        try {
+          if (manager.steer(record.id, params.message)) {
+            pi.events.emit("subagents:steered", { id: record.id, message: params.message });
+            return textResult(`Steering message sent to agent ${record.id}.`);
+          }
+        } catch (err) {
+          return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        // Session not ready yet and no UDS client — queue the steer for delivery once initialized
         if (!record.pendingSteers) record.pendingSteers = [];
         record.pendingSteers.push(params.message);
         pi.events.emit("subagents:steered", { id: record.id, message: params.message });
@@ -3475,6 +3522,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
+      defaultTransport: getDefaultTransport(),
+      tmuxEnabled: isTmuxEnabled(),
     } satisfies SubagentsSettings;
   }
 
@@ -3650,6 +3699,20 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["off", "assistant", "all"],
         },
         {
+          id: "defaultTransport",
+          label: "Default transport",
+          description: "Default transport mechanism for all subagents: in-process (current behavior, runs inline) or uds (separate child process via Unix Domain Sockets). Agents can override per-call or via frontmatter. Tmux is a separate display option below.",
+          currentValue: getDefaultTransport(),
+          values: ["in-process", "uds"],
+        },
+        {
+          id: "tmuxEnabled",
+          label: "Tmux display",
+          description: "Run UDS agents in a tmux window for direct terminal interaction. Only applies when transport is 'uds'. Requires tmux installed.",
+          currentValue: isTmuxEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
           id: "fleetView",
           label: "Fleet view",
           description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter to view)",
@@ -3823,6 +3886,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "viewerMarkdown") {
         setViewerMarkdown(value as ViewerMarkdownMode);
         notifyApplied(ctx, `Viewer markdown set to ${value}`);
+      } else if (id === "defaultTransport") {
+        setDefaultTransport(value as "in-process" | "uds");
+        notifyApplied(ctx, `Default transport set to "${value}". Applies to new agent spawns.`);
+      } else if (id === "tmuxEnabled") {
+        const enabled = value === "on";
+        setTmuxEnabled(enabled);
+        notifyApplied(ctx, `Tmux display ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);

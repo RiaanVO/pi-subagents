@@ -15,17 +15,20 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+import net from "node:net";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { resumeAgent, runAgent, type ToolActivity, DEFAULT_TRANSPORT } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
+import { cleanupUdsAgent, steerUdsAgent, abortUdsAgent, type UdsRunOptions, type UdsRunResult } from "./uds-agent-runner.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -195,6 +198,13 @@ interface SpawnOptions {
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
   maxTurns?: number;
+  /** Transport mechanism: 'in-process' (default) or 'uds' for separate child process. */
+  transport?: import("./types.js").AgentTransport;
+  /**
+   * Whether a UDS child should be spawned inside a tmux window.
+   * Only meaningful when transport === "uds". Ignored for "in-process".
+   */
+  tmuxEnabled?: boolean;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -288,7 +298,7 @@ interface SpawnOptions {
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /** Called once per assistant message_end with that message's usage delta. */
-  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number; cost?: number }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
   /** Nesting depth: top-level subagent = 1. */
@@ -315,7 +325,7 @@ interface ResumeOptions {
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called once per assistant message_end with that message's usage delta. */
-  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number; cost?: number }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
   /**
@@ -374,6 +384,16 @@ export class AgentManager {
   private worktreeRepos = new Set<string>();
 
   /**
+   * UDS client tracking — maps agentId to {client socket, socketPath} for
+   * agents running via the UDS transport. Enables steering/abort through
+   * the socket rather than the in-process session.
+   */
+  private udsClients = new Map<string, { client: net.Socket; socketPath: string }>();
+
+  /** Timer for cleaning up stale UDS socket files not owned by any running agent. */
+  private udsSocketCleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
    * Startup phases, keyed by agent id. `spawn()` still returns synchronously,
    * but an agent using worktree isolation is not running yet when it does —
    * copying the repo is an awaited git call. This is what `awaitStartup` hands
@@ -427,6 +447,8 @@ export class AgentManager {
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
+    // Periodic cleanup of stale UDS socket files
+    this.startStaleSocketCleanup();
   }
 
   /** Update the max concurrent background agents limit. */
@@ -758,6 +780,35 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
+    // Resolve transport: 'uds' forks a child process; 'in-process' runs inline.
+    const transport = (options as SpawnOptions & { transport?: import("./types.js").AgentTransport }).transport ?? DEFAULT_TRANSPORT;
+    const tmuxEnabled = options.tmuxEnabled ?? false;
+
+    // UDS path: fork a child process and manage via socket
+    if (transport === "uds") {
+      if (tmuxEnabled) {
+        return this.startViaTmuxUds(id, record, pi, ctx, type, prompt, options, baseCwd, customCwd, worktreeCwd)
+          .catch(async (err) => {
+            if (pool === "foreground") record.resultConsumed = true;
+            record.status = "error";
+            record.error = err instanceof Error ? err.message : String(err);
+            record.completedAt = Date.now();
+            releaseSlot();
+            this.drainQueue();
+          });
+      }
+      return this.startViaUds(id, record, pi, ctx, type, prompt, options, baseCwd, customCwd, worktreeCwd)
+        .catch(async (err) => {
+          if (pool === "foreground") record.resultConsumed = true;
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+          releaseSlot();
+          this.drainQueue();
+        });
+    }
+
+    // In-process path (default)
     const promise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
@@ -945,6 +996,531 @@ export class AgentManager {
     // starts. Read off the options, so a spawn that started from a queue drain
     // still reaches the caller that queued it.
     options.onSpawned?.(id);
+  }
+
+  /**
+   * Start an agent via UDS transport: fork a child process, connect to its socket,
+   * and stream events back through the socket. The child handles its own session
+   * lifecycle; this process only observes and forwards.
+   *
+   * Returns a promise that resolves when the child completes (or rejects on failure).
+   */
+  private async startViaUds(
+    id: string,
+    record: AgentRecord,
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    type: SubagentType,
+    prompt: string,
+    options: SpawnOptions,
+    baseCwd: string,
+    customCwd: string | undefined,
+    worktreeCwd: string | undefined,
+  ): Promise<void> {
+    const { runViaUds } = await import("./uds-agent-runner.js");
+
+    // Build effective cwd for the child: worktree > customCwd > ctx.cwd
+    const effectiveCwd = worktreeCwd ?? customCwd ?? ctx.cwd;
+
+    // Build configCwd: where .pi config is discovered
+    const configCwd = options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined);
+
+    // Build UdsRunOptions from the SpawnOptions
+    const udsOptions: UdsRunOptions = {
+      pi,
+      transport: "uds",
+      agentId: id,
+      model: options.model,
+      maxTurns: options.maxTurns,
+      isolated: options.isolated,
+      inheritContext: options.inheritContext,
+      thinkingLevel: options.thinkingLevel,
+      structuredOutput: options.structuredOutput,
+      resumeSessionFile: options.resumeSessionFile,
+      nested: options.parentAgentId !== undefined,
+      workflow: options.workflowId !== undefined,
+      cwd: effectiveCwd,
+      worktreeBase: worktreeCwd ? baseCwd : undefined,
+      configCwd,
+      signal: record.abortController!.signal,
+      onToolActivity: (activity) => {
+        if (activity.type === "end") record.toolUses++;
+        options.onToolActivity?.(activity);
+      },
+      onTurnEnd: options.onTurnEnd,
+      onTextDelta: options.onTextDelta,
+      onAssistantUsage: (usage) => {
+        addUsage(record.lifetimeUsage, usage);
+        this.onUsage?.(record, usage);
+        options.onAssistantUsage?.(usage);
+      },
+      onCompaction: (info) => {
+        record.compactionCount++;
+        this.onCompact?.(record, info);
+        options.onCompaction?.(info);
+      },
+      nestedRuntime: {
+        manager: this,
+        parentAgentId: id,
+        depth: record.depth ?? 1,
+        maxSubagentDepth: record.maxSubagentDepth,
+      },
+      // Note: UDS path does not have in-process onSessionCreated
+      // since there is no AgentSession here — the child handles it.
+      onClientConnected: (client, socketPath) => {
+        // Register immediately so steer() / abort() can reach the child
+        // while it is still running (not just after completion).
+        this.udsClients.set(id, { client, socketPath });
+      },
+    };
+
+    // Run via UDS — `runViaUds` connects to the child socket and streams events.
+    // The returned `client` is stored in `udsClients` immediately so that
+    // `steer()` / `abort()` can reach it while the child is still running.
+    const udsRunPromise = runViaUds(ctx, type, prompt, udsOptions);
+
+    record.promise = udsRunPromise
+      .then(async ({ responseText, session: _session, aborted, steered, failure, structuredJson, structuredRetried, client, socketPath }) => {
+        // Don't overwrite status if externally stopped via abort()
+        if (record.status !== "stopped") {
+          if (aborted) {
+            record.status = "aborted";
+          } else if (failure) {
+            record.status = "error";
+            record.error = failure;
+          } else {
+            record.status = steered ? "steered" : "completed";
+          }
+        }
+        record.result = responseText;
+        record.structuredJson = structuredJson;
+        record.structuredRetried = structuredRetried;
+        // No session for UDS agents — session stays undefined
+        record.completedAt ??= Date.now();
+
+        // Track the UDS client for steering/abort (must happen BEFORE settle)
+        this.udsClients.set(id, { client, socketPath });
+
+        // Final flush of streaming output file
+        if (record.outputCleanup) {
+          try { record.outputCleanup(); } catch { /* ignore */ }
+          record.outputCleanup = undefined;
+        }
+
+        this.abortOwnedChildren(id);
+
+        this.settleRun(record, true, "background");
+        // Clean up UDS client after settling
+        const udsEntry = this.udsClients.get(id);
+        if (udsEntry) {
+          this.udsClients.delete(id);
+          try { await cleanupUdsAgent(udsEntry.client, udsEntry.socketPath); } catch { /* ignore */ }
+        }
+        return responseText;
+      })
+      .catch(async (err) => {
+        // If runViaUds threw before connecting, there is no client to clean.
+        // Read off the promise (which may already have resolved) to get the
+        // client for teardown.
+        try {
+          const result = await udsRunPromise;
+          const udsEntry = this.udsClients.get(id);
+          if (udsEntry) {
+            this.udsClients.delete(id);
+            try { await cleanupUdsAgent(udsEntry.client, udsEntry.socketPath); } catch { /* ignore */ }
+          }
+        } catch { /* already cleaned or never connected */ }
+
+        if (record.status !== "stopped") {
+          record.status = "error";
+        }
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt ??= Date.now();
+
+        // Final flush of streaming output file on error
+        if (record.outputCleanup) {
+          try { record.outputCleanup(); } catch { /* ignore */ }
+          record.outputCleanup = undefined;
+        }
+
+        this.abortOwnedChildren(id);
+
+        this.settleRun(record, false, "background");
+        return "";
+      });
+
+    // Notify caller that spawn is complete (record is in the map, promise is set).
+    options.onSpawned?.(id);
+  }
+
+  /**
+   * Spawn a UDS child inside a tmux window, connect to its socket, and stream events.
+   * Delegates the tmux spawn to tmux-workspace, then connects via the socket.
+   */
+  private async startViaTmuxUds(
+    id: string,
+    record: AgentRecord,
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    type: SubagentType,
+    prompt: string,
+    options: SpawnOptions,
+    baseCwd: string,
+    customCwd: string | undefined,
+    worktreeCwd: string | undefined,
+  ): Promise<void> {
+    const { spawnUdsSubagent, getSocketPathForWindow } = await import("./tmux-workspace.js");
+
+    // Delegate tmux spawn to tmux-workspace
+    const result = spawnUdsSubagent(type, prompt, {
+      cwd: worktreeCwd ?? customCwd ?? ctx.cwd,
+      model: options.model ? `${(options.model as any).provider}/${(options.model as any).id}` : undefined,
+      thinking: options.thinkingLevel,
+      maxTurns: options.maxTurns,
+      isolated: options.isolated,
+      resumeSession: options.resumeSessionFile,
+      agentId: id,
+    });
+
+    if (!result) {
+      throw new Error(`Failed to spawn agent "${type}" in tmux window`);
+    }
+
+    // Capture the socket path and window name
+    const socketPath = result.socketPath;
+    const windowName = result.windowName;
+
+    // Capture tmux window info on the record for UI display
+    record.tmuxWindow = windowName;
+
+    // Build configCwd: where .pi config is discovered
+    const configCwd = options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined);
+
+    // Connect to the socket and stream events
+    // Capture the result for .then/.catch chaining
+    const streamPromise = this.streamFromUdsSocket(id, record, socketPath, ctx, type, prompt, {
+      ...options,
+      configCwd,
+      cwd: worktreeCwd ?? customCwd,
+      worktreeBase: worktreeCwd ? baseCwd : undefined,
+      signal: record.abortController!.signal,
+      onToolActivity: (activity) => {
+        if (activity.type === "end") record.toolUses++;
+        options.onToolActivity?.(activity);
+      },
+      onTurnEnd: options.onTurnEnd,
+      onTextDelta: options.onTextDelta,
+      onAssistantUsage: (usage) => {
+        addUsage(record.lifetimeUsage, usage);
+        this.onUsage?.(record, usage);
+        options.onAssistantUsage?.(usage);
+      },
+      onCompaction: (info) => {
+        record.compactionCount++;
+        this.onCompact?.(record, info);
+        options.onCompaction?.(info);
+      },
+      structuredOutput: options.structuredOutput,
+    }, worktreeCwd ?? customCwd ?? ctx.cwd);
+    streamPromise
+      .then(async ({ responseText, aborted, steered, failure, structuredJson, structuredRetried, client, socketPath: cleanupSocketPath }) => {
+        // Don't overwrite status if externally stopped via abort()
+        if (record.status !== "stopped") {
+          if (aborted) {
+            record.status = "aborted";
+          } else if (failure) {
+            record.status = "error";
+            record.error = failure;
+          } else {
+            record.status = steered ? "steered" : "completed";
+          }
+        }
+        record.result = responseText;
+        record.structuredJson = structuredJson;
+        record.structuredRetried = structuredRetried;
+        record.completedAt ??= Date.now();
+
+        // Track the UDS client for steering/abort
+        this.udsClients.set(id, { client, socketPath: cleanupSocketPath });
+
+        // Final flush of streaming output file
+        if (record.outputCleanup) {
+          try { record.outputCleanup(); } catch { /* ignore */ }
+          record.outputCleanup = undefined;
+        }
+
+        this.abortOwnedChildren(id);
+
+        this.settleRun(record, true, "background");
+        // Clean up UDS client after settling
+        const udsEntry = this.udsClients.get(id);
+        if (udsEntry) {
+          this.udsClients.delete(id);
+          try { await cleanupUdsAgent(udsEntry.client, udsEntry.socketPath); } catch { /* ignore */ }
+        }
+        return responseText;
+      })
+      .catch(async (err) => {
+        if (record.status !== "stopped") {
+          record.status = "error";
+        }
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt ??= Date.now();
+
+        if (record.outputCleanup) {
+          try { record.outputCleanup(); } catch { /* ignore */ }
+          record.outputCleanup = undefined;
+        }
+
+        this.abortOwnedChildren(id);
+        this.settleRun(record, false, "background");
+        return "";
+      });
+  }
+
+  /**
+   * Connect to an existing UDS socket and stream events into a record.
+   * Shared helper used by both startViaUds (via uds-agent-runner) and startViaTmuxUds.
+   */
+  private async streamFromUdsSocket(
+    id: string,
+    record: AgentRecord,
+    socketPath: string,
+    ctx: ExtensionContext,
+    type: SubagentType,
+    prompt: string,
+    options: Omit<SpawnOptions, "isBackground"> & {
+      configCwd?: string;
+      cwd?: string;
+      worktreeBase?: string;
+    },
+    effectiveCwd: string,
+  ): Promise<import("./uds-agent-runner.js").UdsRunResult> {
+    const { runViaUds } = await import("./uds-agent-runner.js");
+
+    // Build UdsRunOptions — reuse the same child process infrastructure
+    const agentConfig = (await import("./agent-types.js")).getAgentConfig(type);
+    const { resolveDefaultModel, resolveEffectiveMaxTurns } = await import("./agent-runner.js");
+    const { getToolNamesForType } = await import("./agent-types.js");
+
+    const resolvedModel = options.model ?? resolveDefaultModel(
+      ctx.model, ctx.modelRegistry, agentConfig?.model,
+    );
+    const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+    const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+    const toolNames = getToolNamesForType(type);
+
+    // Build child environment — match what runViaUds does
+    const { randomUUID } = await import("node:crypto");
+    const { mkdirSync, accessSync, writeFileSync, unlinkSync, existsSync } = await import("node:fs");
+    const { fork } = await import("node:child_process");
+    const { homedir } = await import("node:os");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join } = await import("node:path");
+
+    const SUBAGENT_SOCKET_DIR = join(homedir(), ".pi", "subagents", "sockets");
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const projectRoot = join(moduleDir, "..");
+    const UDS_SERVER_PATH = join(projectRoot, "dist", "uds-server.js");
+    const UDS_CHILD_PATH = join(projectRoot, "src", "uds-child.mjs");
+    const TSC_PATH = join(projectRoot, "node_modules", ".bin", "tsc");
+
+    // We need to use the original socket path from tmux, not generate a new one
+    // But runViaUds generates its own socket. Instead, we'll use its connection logic.
+    // The simplest approach: pass the pre-existing socket to a custom runner.
+    // For now, reuse runViaUds but override the socket — this requires a minor hack.
+    // Better: create a wrapper that connects to an existing socket.
+
+    // Since runViaUds handles spawning, we need a lightweight connect-only version.
+    // Use net module directly for the tmux case.
+    const net = await import("node:net");
+
+    // Wait for socket to be ready
+    const SOCKET_POLL_INTERVAL_MS = 50;
+    const SOCKET_POLL_TIMEOUT_MS = 5_000;
+    const CONNECT_TIMEOUT_MS = 5_000;
+
+    let socketReady = false;
+    await new Promise<void>((resolve, reject) => {
+      let elapsed = 0;
+      const timer = setInterval(() => {
+        elapsed += SOCKET_POLL_INTERVAL_MS;
+        try {
+          accessSync(socketPath);
+          socketReady = true;
+          clearInterval(timer);
+          resolve();
+        } catch {
+          if (elapsed >= SOCKET_POLL_TIMEOUT_MS) {
+            clearInterval(timer);
+            reject(new Error(`Socket ${socketPath} not ready within ${SOCKET_POLL_TIMEOUT_MS}ms`));
+          }
+        }
+      }, SOCKET_POLL_INTERVAL_MS);
+      timer.unref();
+    });
+
+    // Connect to the socket
+    const client = net.createConnection({ path: socketPath });
+
+    await new Promise<void>((resolve, reject) => {
+      client.once("connect", () => resolve());
+      client.once("error", (err) => reject(err));
+      const timer = setTimeout(() => {
+        client.destroy();
+        reject(new Error(`Failed to connect to UDS socket at ${socketPath} within ${CONNECT_TIMEOUT_MS}ms`));
+      }, CONNECT_TIMEOUT_MS);
+      timer.unref();
+    });
+
+    // Set up message parsing
+    let buffer = "";
+    let readyReceived = false;
+
+    let responseText = "";
+    let turnCount = 0;
+    let toolUses = 0;
+    let completed = false;
+    let aborted = false;
+    let error: string | undefined;
+    let structuredJson: string | undefined;
+    let structuredRetried = false;
+
+    client.on("data", (data: Buffer) => {
+      buffer += data.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (line.trim()) {
+          try {
+            const msg = JSON.parse(line) as any;
+            if (msg.type === "ready" && !readyReceived) {
+              readyReceived = true;
+            }
+            handleChildEvent(msg);
+          } catch { /* skip malformed */ }
+        }
+      }
+    });
+
+    function sendCommand(command: Record<string, unknown>): void {
+      if (!client.destroyed && !client.writableEnded) {
+        client.write(JSON.stringify(command) + "\n");
+      }
+    }
+
+    function handleChildEvent(msg: any): void {
+      switch (msg.type) {
+        case "turn_start": turnCount++; break;
+        case "turn_end": if (msg.turnCount != null) turnCount = msg.turnCount; break;
+        case "text_delta":
+          responseText += msg.delta;
+          options.onTextDelta?.(msg.delta as string, responseText);
+          break;
+        case "tool_execution_start":
+          toolUses++;
+          options.onToolActivity?.({ type: "start", toolName: msg.toolName as string });
+          break;
+        case "tool_execution_end":
+          options.onToolActivity?.({ type: "end", toolName: msg.toolName as string });
+          break;
+        case "message_end": {
+          const usage = msg.usage;
+          if (usage) {
+            options.onAssistantUsage?.({
+              input: usage.input,
+              output: usage.output,
+              cacheWrite: usage.cacheWrite ?? 0,
+              cost: usage.cost,
+            });
+          }
+          break;
+        }
+        case "compaction":
+          options.onCompaction?.({
+            reason: (msg.reason as "manual" | "threshold" | "overflow") ?? "threshold",
+            tokensBefore: msg.tokensBefore ?? 0,
+          });
+          break;
+        case "completed":
+          completed = true;
+          if (msg.result != null && msg.result !== "") responseText = msg.result as string;
+          break;
+        case "aborted": aborted = true; completed = true; break;
+        case "error": error = msg.message; completed = true; break;
+      }
+    }
+
+    // Send prompt as steer command
+    if (readyReceived) {
+      sendCommand({ type: "steer", message: prompt });
+    } else {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          sendCommand({ type: "steer", message: prompt });
+          resolve();
+        }, 2000);
+        timer.unref();
+        const originalHandler = client.listeners("data");
+        const waitForReady = (data: Buffer) => {
+          const text = data.toString();
+          const lines = text.split("\n");
+          for (const line of lines) {
+            if (line.trim()) {
+              try {
+                const msg = JSON.parse(line) as any;
+                if (msg.type === "ready") {
+                  clearTimeout(timer);
+                  client.removeListener("data", waitForReady);
+                  for (const h of originalHandler) client.on("data", h);
+                  sendCommand({ type: "steer", message: prompt });
+                  resolve();
+                  return;
+                }
+              } catch { /* skip */ }
+            }
+          }
+        };
+        client.on("data", waitForReady);
+      });
+    }
+
+    // Handle abort signal
+    const abortPromise = new Promise<void>((resolve) => {
+      if (!options.signal) { resolve(); return; }
+      if (options.signal.aborted) { sendCommand({ type: "abort" }); resolve(); return; }
+      options.signal.addEventListener("abort", () => {
+        aborted = true;
+        sendCommand({ type: "abort" });
+        resolve();
+      }, { once: true });
+    });
+
+    // Wait for completion
+    const completionPromise = new Promise<void>((resolve) => {
+      const checkCompletion = setInterval(() => {
+        if (completed) { clearInterval(checkCompletion); resolve(); }
+      }, 100);
+      checkCompletion.unref();
+    });
+
+    await Promise.race([completionPromise, abortPromise]);
+
+    // Cleanup
+    try { client.destroy(); } catch { /* ignore */ }
+    try { unlinkSync(socketPath); } catch { /* ignore */ }
+
+    return {
+      responseText: responseText.trim(),
+      session: null as any,
+      aborted,
+      steered: false,
+      failure: error,
+      structuredJson,
+      structuredRetried,
+      client,
+      socketPath,
+    };
   }
 
   /**
@@ -1313,13 +1889,23 @@ export class AgentManager {
    * tool). A live session delivers it now — it interrupts the agent after its
    * current tool execution and appears as a user message. If the session isn't
    * ready yet, the message is queued on `pendingSteers` and flushed when the
-   * session is created. Returns false if the agent can't accept steering
-   * (unknown id, or no longer running/queued).
+   * session is created. For UDS agents, steering is sent through the socket.
+   * Returns false if the agent can't accept steering (unknown id, or no longer
+   * running/queued).
    */
   steer(id: string, message: string): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
     if (record.status !== "running" && record.status !== "queued") return false;
+
+    // UDS path: send through the socket
+    const udsClient = this.udsClients.get(id);
+    if (udsClient) {
+      steerUdsAgent(udsClient.client, message);
+      return true;
+    }
+
+    // In-process path: steer through session
     if (record.session) {
       record.session.steer(message).catch(() => {});
     } else {
@@ -1419,6 +2005,17 @@ export class AgentManager {
     }
 
     if (record.status !== "running") return false;
+
+    // UDS path: send abort command through the socket
+    const udsClient = this.udsClients.get(id);
+    if (udsClient) {
+      abortUdsAgent(udsClient.client);
+      this.udsClients.delete(id); // Clean up UDS client entry to avoid stale references
+      record.status = "stopped";
+      record.completedAt = Date.now();
+      return true;
+    }
+
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
@@ -1550,18 +2147,61 @@ export class AgentManager {
   }
 
   /**
+   * Start a periodic timer that removes stale UDS socket files not owned by
+   * any running agent. This prevents socket file accumulation across sessions.
+   * Runs every 30 seconds.
+   */
+  private startStaleSocketCleanup(): void {
+    if (this.udsSocketCleanupTimer) return;
+    this.udsSocketCleanupTimer = setInterval(() => {
+      const socketDir = join(homedir(), ".pi", "subagents", "sockets");
+      try {
+        if (!existsSync(socketDir)) return;
+        const files = readdirSync(socketDir);
+        for (const file of files) {
+          if (!file.startsWith("sock-")) continue;
+          const socketPath = join(socketDir, file);
+          // Check if any agent owns this socket
+          const owned = Array.from(this.udsClients.entries()).some(
+            ([_, { socketPath: sp }]) => sp === socketPath,
+          );
+          if (!owned) {
+            try { statSync(socketPath); } catch { continue; } // skip dirs
+            try { require("node:fs").unlinkSync(socketPath); } catch { /* ignore */ }
+          }
+        }
+      } catch { /* ignore cleanup errors */ }
+    }, 30_000);
+    this.udsSocketCleanupTimer.unref();
+  }
+
+  /** Stop the periodic stale socket cleanup timer. */
+  private stopStaleSocketCleanup(): void {
+    if (this.udsSocketCleanupTimer) {
+      clearInterval(this.udsSocketCleanupTimer);
+      this.udsSocketCleanupTimer = null;
+    }
+  }
+
+  /**
    * @param pi - Needed to run `git worktree prune`, which is async now and so
    *   cannot be reached through a stored spawn argument at shutdown. Omitting
    *   it (tests, teardown of a manager that never spawned) skips the prune.
    */
   async dispose(pi?: ExtensionAPI): Promise<void> {
     clearInterval(this.cleanupInterval);
+    this.stopStaleSocketCleanup();
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
     this.dequeue(() => true);
     const sessions = [...this.agents.values()].map(record => record.session);
     this.agents.clear();
     this.startups.clear();
+    // Clean up all UDS client connections and their socket files
+    for (const [, { client, socketPath }] of this.udsClients) {
+      try { await cleanupUdsAgent(client, socketPath); } catch { /* ignore */ }
+    }
+    this.udsClients.clear();
     if (pi) {
       // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
       // on the shutdown path, which cannot wait for git. Started before the awaited
