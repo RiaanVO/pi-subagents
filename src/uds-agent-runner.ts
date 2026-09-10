@@ -96,6 +96,10 @@ export async function runViaUds(
   options: UdsRunOptions,
 ): Promise<UdsRunResult> {
   // ─── 1. Resolve configuration (same as agent-runner.ts) ───────────────
+  // TODO: In a future refactoring, runViaUds() should delegate the
+  // socket-connection logic (polling, connection, message parsing, steer,
+  // abort, completion polling) to connectToUdsSocket() once the child
+  // process details are factored into the config passed to that function.
 
   const agentConfig = getAgentConfig(type);
   const effectiveCwd = options.cwd ?? ctx.cwd ?? process.cwd();
@@ -512,6 +516,265 @@ async function cleanupSocket(socketPath: string): Promise<void> {
   try {
     unlinkSync(socketPath);
   } catch { /* socket may have already been cleaned up by child */ }
+}
+
+// ---------------------------------------------------------------------------
+// connectToUdsSocket — Connect to a pre-existing UDS socket and stream events
+// ---------------------------------------------------------------------------
+
+/**
+ * Connect to an existing UDS socket, send a steer command, and wait for completion.
+ *
+ * This function encapsulates the shared socket-connection logic used by both
+ * `runViaUds()` (which spawns a child) and `streamFromUdsSocket()` (which
+ * connects to an existing socket). It handles: socket polling, connection,
+ * message parsing, steer with ready-handshake, abort signal, and completion
+ * polling.
+ *
+ * @param socketPath - Filesystem path to the UDS socket.
+ * @param prompt - The steer message to send once connected.
+ * @param config - Agent configuration (used for future refactoring).
+ * @param options - Streaming callbacks and abort signal.
+ * @returns A `UdsRunResult` with the same shape as `runViaUds()`.
+ */
+export async function connectToUdsSocket(
+  socketPath: string,
+  prompt: string,
+  config: { agentType: SubagentType; model: any; thinkingLevel: ThinkingLevel | undefined; maxTurns: number | undefined; toolNames: string[] },
+  options: {
+    onTextDelta?: (delta: string, fullText: string) => void;
+    onToolActivity?: (activity: ToolActivity) => void;
+    onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number; cost?: number }) => void;
+    onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+    signal?: AbortSignal;
+  },
+): Promise<UdsRunResult> {
+  // ── 1. Poll for socket existence ────────────────────────────────────
+  let socketReady = false;
+  await new Promise<void>((resolve, reject) => {
+    let elapsed = 0;
+    const timer = setInterval(() => {
+      elapsed += SOCKET_POLL_INTERVAL_MS;
+      try {
+        accessSync(socketPath);
+        socketReady = true;
+        clearInterval(timer);
+        resolve();
+      } catch {
+        if (elapsed >= SOCKET_POLL_TIMEOUT_MS) {
+          clearInterval(timer);
+          reject(new Error(`Socket ${socketPath} not ready within ${SOCKET_POLL_TIMEOUT_MS}ms`));
+        }
+      }
+    }, SOCKET_POLL_INTERVAL_MS);
+    timer.unref();
+  });
+
+  // ── 2. Connect to the socket ────────────────────────────────────────
+  const client = net.createConnection({ path: socketPath });
+
+  await new Promise<void>((resolve, reject) => {
+    client.once("connect", () => resolve());
+    client.once("error", (err) => reject(err));
+    const timer = setTimeout(() => {
+      client.destroy();
+      reject(new Error(`Failed to connect to UDS socket at ${socketPath} within ${CONNECT_TIMEOUT_MS}ms`));
+    }, CONNECT_TIMEOUT_MS);
+    timer.unref();
+  });
+
+  // ── 3. State variables ──────────────────────────────────────────────
+  let buffer = "";
+  let readyReceived = false;
+  let responseText = "";
+  let turnCount = 0;
+  let toolUses = 0;
+  let completed = false;
+  let aborted = false;
+  let error: string | undefined;
+
+  // ── 4. Data handler ─────────────────────────────────────────────────
+  client.on("data", (data: Buffer) => {
+    buffer += data.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (line.trim()) {
+        try {
+          const msg = JSON.parse(line) as ChildMessage;
+          if (msg.type === "ready" && !readyReceived) {
+            readyReceived = true;
+          }
+          handleChildEvent(msg);
+        } catch { /* skip malformed */ }
+      }
+    }
+  });
+
+  // ── 5. sendCommand helper ───────────────────────────────────────────
+  function sendCommand(command: Record<string, unknown>): void {
+    if (!client.destroyed && !client.writableEnded) {
+      client.write(JSON.stringify(command) + "\n");
+    }
+  }
+
+  // ── 6. handleChildEvent ─────────────────────────────────────────────
+  function handleChildEvent(msg: ChildMessage): void {
+    switch (msg.type) {
+      case "turn_start": {
+        turnCount++;
+        break;
+      }
+
+      case "turn_end": {
+        if (msg.turnCount != null) turnCount = msg.turnCount;
+        break;
+      }
+
+      case "text_delta": {
+        responseText += msg.delta as string;
+        options.onTextDelta?.(msg.delta as string, responseText);
+        break;
+      }
+
+      case "tool_execution_start": {
+        toolUses++;
+        options.onToolActivity?.({ type: "start", toolName: msg.toolName as string });
+        break;
+      }
+
+      case "tool_execution_end": {
+        options.onToolActivity?.({ type: "end", toolName: msg.toolName as string });
+        break;
+      }
+
+      case "message_end": {
+        const usage = msg.usage;
+        if (usage) {
+          options.onAssistantUsage?.({
+            input: usage.input,
+            output: usage.output,
+            cacheWrite: usage.cacheWrite ?? 0,
+            cost: usage.cost,
+          });
+        }
+        break;
+      }
+
+      case "compaction": {
+        options.onCompaction?.({
+          reason: (msg.reason as "manual" | "threshold" | "overflow") ?? "threshold",
+          tokensBefore: msg.tokensBefore ?? 0,
+        });
+        break;
+      }
+
+      case "completed": {
+        completed = true;
+        if (msg.result != null && msg.result !== "") {
+          responseText = msg.result as string;
+        }
+        break;
+      }
+
+      case "aborted": {
+        aborted = true;
+        completed = true;
+        break;
+      }
+
+      case "error": {
+        error = msg.message;
+        completed = true;
+        break;
+      }
+
+      default:
+        // Unknown message type — ignore
+        break;
+    }
+  }
+
+  // ── 7. Steer command with ready handshake (simpler version) ─────────
+  // Does NOT re-register the original data handler after ready arrives.
+  if (readyReceived) {
+    sendCommand({ type: "steer", message: prompt });
+  } else {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        console.error(`[uds-runner] Warning: steer sent without ready handshake (took >2s)`);
+        sendCommand({ type: "steer", message: prompt });
+        resolve();
+      }, 2000);
+      timer.unref();
+
+      const waitForReady = (data: Buffer) => {
+        const text = data.toString();
+        const lines = text.split("\n");
+        for (const line of lines) {
+          if (line.trim()) {
+            try {
+              const msg = JSON.parse(line) as ChildMessage;
+              if (msg.type === "ready") {
+                clearTimeout(timer);
+                client.removeListener("data", waitForReady);
+                sendCommand({ type: "steer", message: prompt });
+                resolve();
+                return;
+              }
+            } catch { /* skip */ }
+          }
+        }
+      };
+      client.on("data", waitForReady);
+    });
+  }
+
+  // ── 8. Abort signal handling ────────────────────────────────────────
+  const abortPromise = new Promise<void>((resolve) => {
+    if (!options.signal) {
+      // No signal — don't resolve here; completionPromise handles normal completion.
+      // The race will pick completionPromise since abortPromise stays pending.
+      return;
+    }
+    if (options.signal.aborted) {
+      sendCommand({ type: "abort" });
+      resolve();
+      return;
+    }
+    options.signal.addEventListener("abort", () => {
+      aborted = true;
+      sendCommand({ type: "abort" });
+      resolve();
+    }, { once: true });
+  });
+
+  // ── 9. Completion polling (100ms interval on `completed` flag) ──────
+  const completionPromise = new Promise<void>((resolve) => {
+    const checkCompletion = setInterval(() => {
+      if (completed) {
+        clearInterval(checkCompletion);
+        resolve();
+      }
+    }, 100);
+    checkCompletion.unref();
+  });
+
+  await Promise.race([completionPromise, abortPromise]);
+
+  // ── 10. Cleanup & return ────────────────────────────────────────────
+  try { client.destroy(); } catch { /* ignore */ }
+  await cleanupSocket(socketPath);
+
+  return {
+    responseText: responseText.trim(),
+    session: null as unknown as AgentSession,
+    aborted,
+    steered: false,
+    failure: error,
+    client,
+    socketPath,
+  };
 }
 
 // ---------------------------------------------------------------------------

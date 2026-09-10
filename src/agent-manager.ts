@@ -1296,231 +1296,25 @@ export class AgentManager {
     },
     effectiveCwd: string,
   ): Promise<import("./uds-agent-runner.js").UdsRunResult> {
-    const { runViaUds } = await import("./uds-agent-runner.js");
-
-    // Build UdsRunOptions — reuse the same child process infrastructure
+    // Delegate to the shared socket-connection logic in uds-agent-runner.
     const agentConfig = (await import("./agent-types.js")).getAgentConfig(type);
     const { resolveDefaultModel, resolveEffectiveMaxTurns } = await import("./agent-runner.js");
     const { getToolNamesForType } = await import("./agent-types.js");
 
-    const resolvedModel = options.model ?? resolveDefaultModel(
-      ctx.model, ctx.modelRegistry, agentConfig?.model,
-    );
-    const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
-    const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
-    const toolNames = getToolNamesForType(type);
-
-    // Build child environment — match what runViaUds does
-    const { randomUUID } = await import("node:crypto");
-    const { mkdirSync, accessSync, writeFileSync, unlinkSync, existsSync } = await import("node:fs");
-    const { fork } = await import("node:child_process");
-    const { homedir } = await import("node:os");
-    const { fileURLToPath } = await import("node:url");
-    const { dirname, join } = await import("node:path");
-
-    const SUBAGENT_SOCKET_DIR = join(homedir(), ".pi", "subagents", "sockets");
-    const moduleDir = dirname(fileURLToPath(import.meta.url));
-    const projectRoot = join(moduleDir, "..");
-    const UDS_SERVER_PATH = join(projectRoot, "dist", "uds-server.js");
-    const UDS_CHILD_PATH = join(projectRoot, "src", "uds-child.mjs");
-    const TSC_PATH = join(projectRoot, "node_modules", ".bin", "tsc");
-
-    // We need to use the original socket path from tmux, not generate a new one
-    // But runViaUds generates its own socket. Instead, we'll use its connection logic.
-    // The simplest approach: pass the pre-existing socket to a custom runner.
-    // For now, reuse runViaUds but override the socket — this requires a minor hack.
-    // Better: create a wrapper that connects to an existing socket.
-
-    // Since runViaUds handles spawning, we need a lightweight connect-only version.
-    // Use net module directly for the tmux case.
-    const net = await import("node:net");
-
-    // Wait for socket to be ready
-    const SOCKET_POLL_INTERVAL_MS = 50;
-    const SOCKET_POLL_TIMEOUT_MS = 5_000;
-    const CONNECT_TIMEOUT_MS = 5_000;
-
-    let socketReady = false;
-    await new Promise<void>((resolve, reject) => {
-      let elapsed = 0;
-      const timer = setInterval(() => {
-        elapsed += SOCKET_POLL_INTERVAL_MS;
-        try {
-          accessSync(socketPath);
-          socketReady = true;
-          clearInterval(timer);
-          resolve();
-        } catch {
-          if (elapsed >= SOCKET_POLL_TIMEOUT_MS) {
-            clearInterval(timer);
-            reject(new Error(`Socket ${socketPath} not ready within ${SOCKET_POLL_TIMEOUT_MS}ms`));
-          }
-        }
-      }, SOCKET_POLL_INTERVAL_MS);
-      timer.unref();
-    });
-
-    // Connect to the socket
-    const client = net.createConnection({ path: socketPath });
-
-    await new Promise<void>((resolve, reject) => {
-      client.once("connect", () => resolve());
-      client.once("error", (err) => reject(err));
-      const timer = setTimeout(() => {
-        client.destroy();
-        reject(new Error(`Failed to connect to UDS socket at ${socketPath} within ${CONNECT_TIMEOUT_MS}ms`));
-      }, CONNECT_TIMEOUT_MS);
-      timer.unref();
-    });
-
-    // Set up message parsing
-    let buffer = "";
-    let readyReceived = false;
-
-    let responseText = "";
-    let turnCount = 0;
-    let toolUses = 0;
-    let completed = false;
-    let aborted = false;
-    let error: string | undefined;
-    let structuredJson: string | undefined;
-    let structuredRetried = false;
-
-    client.on("data", (data: Buffer) => {
-      buffer += data.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (line.trim()) {
-          try {
-            const msg = JSON.parse(line) as any;
-            if (msg.type === "ready" && !readyReceived) {
-              readyReceived = true;
-            }
-            handleChildEvent(msg);
-          } catch { /* skip malformed */ }
-        }
-      }
-    });
-
-    function sendCommand(command: Record<string, unknown>): void {
-      if (!client.destroyed && !client.writableEnded) {
-        client.write(JSON.stringify(command) + "\n");
-      }
-    }
-
-    function handleChildEvent(msg: any): void {
-      switch (msg.type) {
-        case "turn_start": turnCount++; break;
-        case "turn_end": if (msg.turnCount != null) turnCount = msg.turnCount; break;
-        case "text_delta":
-          responseText += msg.delta;
-          options.onTextDelta?.(msg.delta as string, responseText);
-          break;
-        case "tool_execution_start":
-          toolUses++;
-          options.onToolActivity?.({ type: "start", toolName: msg.toolName as string });
-          break;
-        case "tool_execution_end":
-          options.onToolActivity?.({ type: "end", toolName: msg.toolName as string });
-          break;
-        case "message_end": {
-          const usage = msg.usage;
-          if (usage) {
-            options.onAssistantUsage?.({
-              input: usage.input,
-              output: usage.output,
-              cacheWrite: usage.cacheWrite ?? 0,
-              cost: usage.cost,
-            });
-          }
-          break;
-        }
-        case "compaction":
-          options.onCompaction?.({
-            reason: (msg.reason as "manual" | "threshold" | "overflow") ?? "threshold",
-            tokensBefore: msg.tokensBefore ?? 0,
-          });
-          break;
-        case "completed":
-          completed = true;
-          if (msg.result != null && msg.result !== "") responseText = msg.result as string;
-          break;
-        case "aborted": aborted = true; completed = true; break;
-        case "error": error = msg.message; completed = true; break;
-      }
-    }
-
-    // Send prompt as steer command
-    if (readyReceived) {
-      sendCommand({ type: "steer", message: prompt });
-    } else {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          sendCommand({ type: "steer", message: prompt });
-          resolve();
-        }, 2000);
-        timer.unref();
-        const originalHandler = client.listeners("data");
-        const waitForReady = (data: Buffer) => {
-          const text = data.toString();
-          const lines = text.split("\n");
-          for (const line of lines) {
-            if (line.trim()) {
-              try {
-                const msg = JSON.parse(line) as any;
-                if (msg.type === "ready") {
-                  clearTimeout(timer);
-                  client.removeListener("data", waitForReady);
-                  for (const h of originalHandler) client.on("data", h);
-                  sendCommand({ type: "steer", message: prompt });
-                  resolve();
-                  return;
-                }
-              } catch { /* skip */ }
-            }
-          }
-        };
-        client.on("data", waitForReady);
-      });
-    }
-
-    // Handle abort signal
-    const abortPromise = new Promise<void>((resolve) => {
-      if (!options.signal) { resolve(); return; }
-      if (options.signal.aborted) { sendCommand({ type: "abort" }); resolve(); return; }
-      options.signal.addEventListener("abort", () => {
-        aborted = true;
-        sendCommand({ type: "abort" });
-        resolve();
-      }, { once: true });
-    });
-
-    // Wait for completion
-    const completionPromise = new Promise<void>((resolve) => {
-      const checkCompletion = setInterval(() => {
-        if (completed) { clearInterval(checkCompletion); resolve(); }
-      }, 100);
-      checkCompletion.unref();
-    });
-
-    await Promise.race([completionPromise, abortPromise]);
-
-    // Cleanup
-    try { client.destroy(); } catch { /* ignore */ }
-    try { unlinkSync(socketPath); } catch { /* ignore */ }
-
-    return {
-      responseText: responseText.trim(),
-      session: null as any,
-      aborted,
-      steered: false,
-      failure: error,
-      structuredJson,
-      structuredRetried,
-      client,
-      socketPath,
+    const config = {
+      agentType: type,
+      model: resolveDefaultModel(ctx.model, ctx.modelRegistry, agentConfig?.model),
+      thinkingLevel: options.thinkingLevel ?? agentConfig?.thinking,
+      maxTurns: resolveEffectiveMaxTurns(type, options.maxTurns),
+      toolNames: getToolNamesForType(type),
     };
+
+    return (await import("./uds-agent-runner.js")).connectToUdsSocket(
+      socketPath,
+      prompt,
+      config,
+      options,
+    );
   }
 
   /**
