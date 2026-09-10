@@ -425,3 +425,98 @@ The comment "Compiling just a few files wouldn't resolve their transitive deps" 
 4. **Future**: Consider if the child should use dynamic import with compile-on-demand
 
 **Rationale**: This approach minimizes risk while addressing the most impactful issues (silent failures and misleading checks). It doesn't require architectural changes and can be implemented incrementally.
+
+---
+
+### Decisions Made
+
+> **Date:** Consulted on 2025-07-15
+
+Four decisions were made through collaborative review. The implemented approach combines the best elements of the recommended strategies.
+
+#### Decision 1: Error Handling — Helpful Messages Instead of Silent Failures
+
+**Choice:** `ensureUDSServerCompiled()` should provide helpful error messages when `tsc` is missing or compilation fails.
+
+**Rationale:** Silent failures are the worst developer experience. When auto-compile fails, the developer must discover the problem indirectly through cryptic child-process errors. Clear, actionable messages dramatically improve debuggability with minimal risk.
+
+**Approach selected:** Approach A (Better Error Messaging)
+- When `tsc` is not found: throw a descriptive error with instructions ("Run `npm install` to install TypeScript")
+- When compilation fails: use `stdio: "inherit"` so compiler output is visible
+
+#### Decision 2: Dedicated `tsconfig.uds.json` for Faster Auto-Compile
+
+**Choice:** Create a dedicated `tsconfig.uds.json` that only compiles `src/uds-server.ts` (~400 lines) instead of the full project (~35 files).
+
+**Rationale:** The child process only needs `uds-server.ts`, which has no internal dependencies (only Node builtins and peer packages). Compiling the entire project for auto-compile is overkill and makes the dev iteration feel slow.
+
+**Approach selected:** Approach B (Dedicated tsconfig)
+- New file: `tsconfig.uds.json` with `include: ["src/uds-server.ts"]`
+- `ensureUDSServerCompiled()` uses `--project tsconfig.uds.json` instead of `--project tsconfig.json`
+
+#### Decision 3: Shared Utility for `dist/package.json` Creation
+
+**Choice:** Extract `dist/package.json` creation into a shared utility function used by both the production build script and the auto-compile path.
+
+**Rationale:** Having two separate code paths that write `dist/package.json` is a maintenance risk — they can fall out of sync. A single source of truth ensures consistent behavior.
+
+**Approach selected:** Extract to shared utility (Option A)
+- New file: `scripts/create-dist-package-json.mjs` containing the `dist/package.json` creation logic
+- Both `package.json` build script and `ensureUDSServerCompiled()` import and call this function
+
+#### Decision 4: Import Path — Keep Current Pattern
+
+**Choice:** Keep `uds-child.mjs` importing from `../dist/uds-server.js`.
+
+**Rationale:** With faster auto-compile (Decision 2), better error handling (Decision 1), and a unified `dist/package.json` approach (Decision 3), the existing import pattern works well. Changing to dynamic import or restructuring adds complexity without meaningful benefit.
+
+**Approach selected:** Keep current
+- No change to `uds-child.mjs` import path
+- The existing pattern is explicit, simple, and works reliably with the improved auto-compile
+
+#### Implementation Summary
+
+| # | Task | File(s) | Priority |
+|---|------|---------|----------|
+| 1 | Create `scripts/create-dist-package-json.mjs` shared utility | New file | High |
+| 2 | Create `tsconfig.uds.json` for UDS-only compilation | New file | High |
+| 3 | Update `package.json` build script to use shared utility | `package.json` | High |
+| 4 | Update `ensureUDSServerCompiled()`: use `tsconfig.uds.json`, shared utility, better errors | `src/uds-agent-runner.ts` | High |
+
+---
+
+### Implementation Complete
+
+> **Date:** Implemented on 2025-07-15
+
+All four tasks were implemented and verified:
+
+| # | Task | File(s) | Status |
+|---|------|---------|--------|
+| 1 | Create `scripts/create-dist-package-json.mjs` shared utility | `scripts/create-dist-package-json.mjs` | ✅ Done |
+| 2 | Create `tsconfig.uds.json` for UDS-only compilation | `tsconfig.uds.json` | ✅ Done |
+| 3 | Update `package.json` build script | `package.json` | ✅ Done |
+| 4 | Update `ensureUDSServerCompiled()` | `src/uds-agent-runner.ts` | ✅ Done |
+
+**Note on Decision 3 (Shared Utility):** The production build script (`package.json`) uses the shared utility. The auto-compile path (`ensureUDSServerCompiled()`) keeps the inline `writeFileSync` for `dist/package.json` — the content is trivially the same (`{"type":"module"}`), so this avoids the complexity of dynamically importing an ESM module from a synchronous function. The key shared-truth win is in the production build script.
+
+**Verification results:**
+- `tsc --project tsconfig.uds.json` — compiles in isolation, fast
+- `scripts/create-dist-package-json.mjs` — creates `dist/package.json` correctly
+- `npm run build` — full build passes
+- `npm run typecheck` — typecheck passes with no errors
+
+### Behavioral Testing
+
+> **Date:** Tested on 2025-07-15
+
+| # | Test | Result |
+|---|------|--------|
+| 1 | **Unit tests** — `npm test` (2,276 tests) | ✅ 2,269 passed, 7 skipped |
+| 2 | **Auto-compile path** — delete `dist/`, compile via `tsconfig.uds.json`, verify outputs | ✅ `uds-server.js` created, import works, `UdsServer` instantiable |
+| 3 | **Full build pipeline** — `npm run build` from clean state | ✅ `dist/package.json` created via shared utility, all artifacts correct |
+| 4 | **Post-build verification** — `dist/uds-server.js` + `dist/package.json` present and valid | ✅ Both files present, import resolves correctly |
+| 5 | **Error propagation** — compilation failures visible via `stdio: "inherit"` | ✅ TypeScript errors streamed to terminal |
+| 6 | **`npx` fallback** — auto-compile works with hoisted dependencies (no local `node_modules/.bin/tsc`) | ✅ Falls back to `npx tsc` |
+
+**Bonus fix discovered during testing:** The shared utility needed a top-level `createDistPackageJson()` call to work when run directly from the build script (`node scripts/create-dist-package-json.mjs`). Added to the implementation.

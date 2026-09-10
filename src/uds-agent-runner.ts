@@ -130,22 +130,30 @@ export async function runViaUds(
 
   function ensureUDSServerCompiled(): void {
     try { accessSync(UDS_SERVER_PATH); return; } catch { /* missing — compile below */ }
-    // tsc exists and server is compiled — nothing to do.
-    try { accessSync(TSC_PATH); } catch { return; }
 
-    // dist/ is missing or server not compiled — compile the whole project.
-    // The child needs dist/uds-server.js and dist/agent-types.js (for getToolNamesForType,
-    // getAgentConfig). Compiling just a few files wouldn't resolve their transitive deps.
+    // Resolve the tsc command — try local node_modules first, fall back to npx.
+    // This handles hoisted dependencies (e.g. in workspaces) where tsc is only
+    // available via npx rather than a local symlink at node_modules/.bin/tsc.
+    const localTscPath = join(projectRoot, "node_modules", ".bin", "tsc");
+    const tscCmd = existsSync(localTscPath) ? `"${localTscPath}"` : "npx tsc";
+
+    // Compile only the UDS server using dedicated config (fast ~400 lines vs full project ~35 files)
+    const TSCONFIG_UDS = join(projectRoot, "tsconfig.uds.json");
     try {
-      execSync(`"${TSC_PATH}" --project tsconfig.json --outDir dist --skipLibCheck`, {
+      execSync(`${tscCmd} --project "${TSCONFIG_UDS}" --outDir dist --skipLibCheck`, {
         cwd: projectRoot,
-        stdio: "ignore",
+        stdio: "inherit",
       });
-      // Create dist/package.json so Node.js knows dist/uds-server.js is ESM
-      writeFileSync(join(projectRoot, "dist", "package.json"), '{"type":"module"}');
-    } catch {
-      // Compilation failed silently — the child will get its own error.
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `UDS server compilation failed: ${msg}\n` +
+        `Check TypeScript errors by running: cd "${projectRoot}" && ${tscCmd} --project tsconfig.uds.json`,
+      );
     }
+
+    // Create dist/package.json so Node.js knows dist/uds-server.js is ESM
+    writeFileSync(join(projectRoot, "dist", "package.json"), '{"type":"module"}');
   }
 
   ensureUDSServerCompiled();
