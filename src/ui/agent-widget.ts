@@ -7,7 +7,7 @@
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
-import { isTopLevelAgent, type AgentManager } from "../agent-manager.js";
+import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
@@ -498,7 +498,6 @@ export class AgentWidget {
         }
 
         budget -= childTotal;
-        hiddenCount = hiddenCount; // no change yet
 
         // Determine connector
         const connector = isLast ? "└─ " : "├─ ";

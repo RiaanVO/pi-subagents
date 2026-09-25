@@ -81,6 +81,10 @@ beforeEach(() => {
     awaitStartup: vi.fn(async () => {}),
     getRecord: (id: string) => records.get(id),
     resume: vi.fn(),
+    listChildren: (parentId: string) =>
+      Array.from(records.values())
+        .filter(r => r.parentAgentId === parentId)
+        .sort((a, b) => b.startedAt - a.startedAt),
   } as any;
 });
 
@@ -561,5 +565,253 @@ describe("setMaxSubagentDepth clamping", () => {
   it("stores a valid depth unchanged", () => {
     setMaxSubagentDepth(3);
     expect(getMaxSubagentDepth()).toBe(3);
+  });
+});
+
+describe("list_children tool", () => {
+  beforeEach(() => {
+    // Ensure records are clean and spawn counter starts fresh for these tests
+    records.clear();
+  });
+
+  it("returns a clear message when an agent has no children", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3]; // list_children is the 4th tool
+    const result = await execute(list, {});
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toContain("no owned children");
+  });
+
+  it("only shows children owned by this parent, not other agents' children", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3]; // list_children is the 4th tool
+
+    // Create children of this parent
+    records.set("child-1", {
+      id: "child-1",
+      type: "scout",
+      description: "Find files",
+      status: "running",
+      parentAgentId: "parent-1",
+      startedAt: Date.now(),
+    });
+    records.set("child-2", {
+      id: "child-2",
+      type: "reviewer",
+      description: "Review code",
+      status: "completed",
+      result: "Looks good.",
+      parentAgentId: "parent-1",
+      startedAt: Date.now() - 60000,
+      completedAt: Date.now() - 30000,
+    });
+    // Foreign child of a different parent
+    records.set("foreign-child", {
+      id: "foreign-child",
+      type: "scout",
+      description: "Intruder",
+      status: "running",
+      parentAgentId: "other-parent",
+      startedAt: Date.now(),
+    });
+
+    const result = await execute(list, {});
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toContain("child-1");
+    expect(result.content[0].text).toContain("child-2");
+    expect(result.content[0].text).not.toContain("foreign-child");
+    expect(result.content[0].text).toContain("2 child agents");
+  });
+
+  it("includes status, handle, alias, and timing in the output", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3];
+
+    records.set("child-1", {
+      id: "child-1",
+      type: "scout",
+      description: "Analyze logs",
+      status: "running",
+      parentAgentId: "parent-1",
+      handle: "analyze-logs",
+      alias: "log-analyzer",
+      startedAt: 1000000,
+    });
+
+    const result = await execute(list, {});
+    const text = result.content[0].text;
+    expect(text).toContain("child-1");
+    expect(text).toContain("scout");
+    expect(text).toContain("Analyze logs");
+    expect(text).toContain("[running]");
+    expect(text).toContain("@analyze-logs");
+    expect(text).toContain("@log-analyzer");
+  });
+
+  it("truncates result previews to ~200 characters", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3];
+
+    const longResult = "A".repeat(500);
+    records.set("child-1", {
+      id: "child-1",
+      type: "scout",
+      description: "Long result",
+      status: "completed",
+      result: longResult,
+      parentAgentId: "parent-1",
+      startedAt: Date.now(),
+      completedAt: Date.now(),
+    });
+
+    const result = await execute(list, {});
+    const previewMatch = result.content[0].text.match(/— (.+)/);
+    expect(previewMatch).not.toBeNull();
+    expect(previewMatch![1].length).toBeLessThan(250); // 200 chars + ellipsis
+    expect(previewMatch![1]).toContain("…");
+  });
+
+  it("returns children sorted by start time, newest first", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3];
+
+    const oldest = { id: "oldest", type: "s", description: "oldest", status: "completed",
+      parentAgentId: "parent-1", startedAt: 100, completedAt: 200 };
+    const newest = { id: "newest", type: "s", description: "newest", status: "running",
+      parentAgentId: "parent-1", startedAt: 300 };
+    const middle = { id: "middle", type: "s", description: "middle", status: "completed",
+      parentAgentId: "parent-1", startedAt: 200, completedAt: 250 };
+
+    records.set("oldest", oldest as any);
+    records.set("newest", newest as any);
+    records.set("middle", middle as any);
+
+    const result = await execute(list, {});
+    const text = result.content[0].text;
+    // Newest should appear before oldest in the output (descending sort by startedAt)
+    const idxOldest = text.indexOf("oldest");
+    const idxNewest = text.indexOf("newest");
+    const idxMiddle = text.indexOf("middle");
+    expect(idxNewest).toBeLessThan(idxOldest);
+    expect(idxMiddle).toBeLessThan(idxOldest);
+    expect(idxNewest).toBeLessThan(idxMiddle);
+  });
+
+  it("includes error message for failed children", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3];
+
+    records.set("failed-child", {
+      id: "failed-child",
+      type: "scout",
+      description: "Failed task",
+      status: "error",
+      error: "Provider timeout",
+      result: "Partial output before timeout",
+      parentAgentId: "parent-1",
+      startedAt: Date.now(),
+      completedAt: Date.now(),
+    });
+
+    const result = await execute(list, {});
+    const text = result.content[0].text;
+    expect(text).toContain("Failed task");
+    expect(text).toContain("Provider timeout");
+    expect(text).toContain("error");
+  });
+
+  it("list_children works alongside Agent, get_subagent_result, and steer_subagent", async () => {
+    records.clear();
+    const toolsArray = tools(["scout"]);
+    const agent = toolsArray[0];
+    const getResult = toolsArray[1];
+    const steer = toolsArray[2];
+    const list = toolsArray[3];
+
+    // Add a child manually to records (avoids spawn counter issues)
+    records.set("child-1", {
+      id: "child-1",
+      type: "scout",
+      description: "find files",
+      status: "completed",
+      result: "done",
+      parentAgentId: "parent-1",
+      startedAt: Date.now(),
+      completedAt: Date.now(),
+    });
+
+    // List children
+    const listResult = await execute(list, {});
+    expect(listResult.isError).toBe(false);
+    expect(listResult.content[0].text).toContain("child-1");
+
+    // Get result
+    const getResultResult = await execute(getResult, { agent_id: "child-1" });
+    expect(getResultResult.isError).toBe(false);
+
+    // All tools work without interference
+    expect(listResult.content[0].text).toContain("child-1");
+    expect(getResultResult.content[0].text).toContain("done");
+  });
+
+  it("shows completed agents with completion indicator", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3];
+
+    records.set("done-child", {
+      id: "done-child",
+      type: "scout",
+      description: "Done task",
+      status: "completed",
+      result: "All done",
+      parentAgentId: "parent-1",
+      startedAt: Date.now() - 120000,
+      completedAt: Date.now() - 60000,
+    });
+
+    const result = await execute(list, {});
+    expect(result.content[0].text).toContain("(completed)");
+  });
+
+  it("lists multiple children with correct count", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3];
+
+    for (let i = 1; i <= 3; i++) {
+      records.set(`child-${i}`, {
+        id: `child-${i}`,
+        type: "scout",
+        description: `Task ${i}`,
+        status: i === 3 ? "running" : "completed",
+        result: i === 3 ? undefined : `Result ${i}`,
+        parentAgentId: "parent-1",
+        startedAt: Date.now() - (4 - i) * 60000,
+        completedAt: i === 3 ? undefined : Date.now() - (3 - i) * 60000,
+      });
+    }
+
+    const result = await execute(list, {});
+    expect(result.content[0].text).toContain("3 child agents");
+    expect(result.content[0].text).toContain("child-1");
+    expect(result.content[0].text).toContain("child-2");
+    expect(result.content[0].text).toContain("child-3");
+  });
+
+  it("single child uses singular 'child agent'", async () => {
+    const toolsArray = tools();
+    const list = toolsArray[3];
+
+    records.set("only-child", {
+      id: "only-child",
+      type: "scout",
+      description: "Solo task",
+      status: "running",
+      parentAgentId: "parent-1",
+      startedAt: Date.now(),
+    });
+
+    const result = await execute(list, {});
+    expect(result.content[0].text).toContain("1 child agent");
+    expect(result.content[0].text).not.toContain("child agents");
   });
 });

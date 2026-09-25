@@ -87,7 +87,8 @@ export function mentionRoster(
   // only — both names resolve, but showing two rows for one agent reads as two
   // agents. The type handle stays addressable whether or not it is listed.
   for (const record of records) {
-    const handle = record.alias ?? record.handle!;
+    const handle = record.alias ?? record.handle;
+    if (!handle) continue;
     taken.add(handle.toLowerCase());
     if (record.handle) taken.add(record.handle.toLowerCase());
     targets.push({ kind: "record", handle, record, typeLabel: displayNameOf(record.type) });
@@ -99,9 +100,10 @@ export function mentionRoster(
   // started".
   for (const entry of manager.listTombstones()) {
     const handle = entry.alias ?? entry.handle;
+    if (!handle) continue;
     if (taken.has(handle.toLowerCase())) continue;
     taken.add(handle.toLowerCase());
-    taken.add(entry.handle.toLowerCase());
+    if (entry.handle) taken.add(entry.handle.toLowerCase());
     targets.push({ kind: "tombstone", handle, entry, typeLabel: displayNameOf(entry.type) });
   }
 
@@ -186,7 +188,7 @@ function mentionItems(roster: MentionTarget[], line: string, cursorCol: number):
   const typed = match[2].toLowerCase();
   const items: AutocompleteItem[] = [];
   for (const target of roster) {
-    if (!target.handle.toLowerCase().startsWith(typed)) continue;
+    if (!(target.handle?.toLowerCase() ?? "").startsWith(typed)) continue;
     items.push({ value: `@${target.handle}`, label: `@${target.handle}`, description: describeTarget(target) });
   }
   return items.length > 0 ? { items, prefix: `@${match[2]}` } : null;

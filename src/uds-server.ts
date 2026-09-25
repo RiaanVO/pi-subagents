@@ -9,11 +9,10 @@
  * - Reads commands from the client and routes them to the session methods.
  */
 
-import net from "node:net";
 import fs from "node:fs";
+import net from "node:net";
+import type { ImageContent, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { ImageContent } from "@earendil-works/pi-ai";
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Types
@@ -168,6 +167,7 @@ export class UdsServer {
                 seq: nextSeq(),
                 type: "message_start",
                 turnCount,
+                turnCountAtMessageStart,
                 messageId: (event as any).messageId,
                 role: event.message.role,
               });

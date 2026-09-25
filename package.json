@@ -39,7 +39,7 @@
     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "vitest run e2e --reporter=verbose",
+    "test:e2e": "bash test/e2e-parent-exit-cleanup.sh",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/",

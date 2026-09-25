@@ -29,35 +29,28 @@
  *   `pi-tmux results` — show completed subagent results
  */
 
-import { execSync, spawn, type SpawnOptions as SpawnOpts } from "node:child_process";
+import { execSync, } from "node:child_process";
 import {
   existsSync,
-  readFileSync,
-  writeFileSync,
   mkdirSync,
-  statSync,
   readdirSync,
+  readFileSync,
+  statSync,
   unlinkSync,
 } from "node:fs";
-import { nanoid } from "nanoid";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import net from "node:net";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { nanoid } from "nanoid";
 
 // ---- Constants ----
 
 /** Name of the master tmux session that holds all subagent windows. */
 export const TMUX_SESSION_NAME = "pi-subagents";
 
-/** Padding for dashboard alignment. */
-const PADDING = 2;
-
 /** How long to wait for a print-mode agent to complete before timing out (ms). */
 const PRINT_TIMEOUT_MS = 300_000; // 5 minutes
-
-/** Separator character used in tmux pane titles. */
-const TITLE_SEP = " │ ";
 
 /** Base directory for UDS socket files. */
 export const UDS_SOCKET_DIR = join(homedir(), ".pi", "subagents", "sockets");
@@ -169,19 +162,6 @@ export function stopWindow(windowName: string): void {
   sendKeys(windowName, "C-c");
 }
 
-/** Get the current directory of a tmux pane (best-effort). */
-function getPaneCwd(windowName: string): string {
-  try {
-    const output = execSync(
-      `tmux display-message -t ${TMUX_SESSION_NAME}:${windowName} -p "#{pane_current_path}"`,
-      { stdio: "pipe", encoding: "utf-8" },
-    ).trim();
-    return output || process.cwd();
-  } catch {
-    return process.cwd();
-  }
-}
-
 // ---- Core: Spawn Subagents ----
 
 /**
@@ -256,6 +236,9 @@ export function spawnSubagent(
   let cmd = "pi";
   const args: string[] = [];
 
+  // Escape quotes so the prompt survives shell/tmux quoting
+  const _escapedPrompt = prompt.replace(/"/g, '\\"');
+
   if (printMode) {
     // Print mode: run once and exit
     cmd = "pi";
@@ -263,8 +246,7 @@ export function spawnSubagent(
     if (options?.model) args.push("--model", options.model);
     if (options?.thinking) args.push("--thinking", options.thinking);
     if (options?.extraArgs) args.push(...options.extraArgs);
-    // Quote the prompt to handle special characters
-    args.push(`"${prompt}"`);
+    args.push(`"${_escapedPrompt}"`);
   } else {
     // Interactive mode: start a fresh pi session or resume
     if (sessionFile && existsSync(sessionFile)) {
@@ -273,15 +255,12 @@ export function spawnSubagent(
     } else {
       cmd = "pi";
       // Start fresh with the prompt
-      args.push(`"${prompt}"`);
+      args.push(`"${_escapedPrompt}"`);
       if (options?.model) args.push("--model", options.model);
       if (options?.thinking) args.push("--thinking", options.thinking);
       if (options?.extraArgs) args.push(...options.extraArgs);
     }
   }
-
-  // Escape special characters for tmux send-keys
-  const escapedPrompt = prompt.replace(/"/g, '\\"');
 
   try {
     // Create new window, detached
@@ -289,7 +268,7 @@ export function spawnSubagent(
     const cdCmd = `cd ${JSON.stringify(cwd)} && ${cmd} ${args.join(" ")}`;
 
     execSync(
-      `tmux new-window -t ${TMUX_SESSION_NAME}:${windowName} -n "${windowName}" "${cdCmd}"`,
+      `tmux new-window -t ${TMUX_SESSION_NAME} -n "${windowName}" "${cdCmd}"`,
       {
         stdio: "pipe",
         encoding: "utf-8",
@@ -298,7 +277,6 @@ export function spawnSubagent(
 
     // Set the window title to show the agent type and description
     try {
-      const displayDesc = prompt.slice(0, 60) + (prompt.length > 60 ? "..." : "");
       execSync(
         `tmux set-window-option -t ${TMUX_SESSION_NAME}:${windowName} window-status-format "${type}"`,
         { stdio: "pipe" },
@@ -422,7 +400,7 @@ export function spawnUdsSubagent(
   try {
     // Create new window, detached
     execSync(
-      `tmux new-window -t ${TMUX_SESSION_NAME}:${windowName} -n "${windowName}" "${fullCmd}"`,
+      `tmux new-window -t ${TMUX_SESSION_NAME} -n "${windowName}" "${fullCmd}"`,
       {
         stdio: "pipe",
         encoding: "utf-8",
@@ -431,7 +409,6 @@ export function spawnUdsSubagent(
 
     // Set the window title to show the agent type and description
     try {
-      const displayDesc = prompt.slice(0, 60) + (prompt.length > 60 ? "..." : "");
       execSync(
         `tmux set-window-option -t ${TMUX_SESSION_NAME}:${windowName} window-status-format "${type}"`,
         { stdio: "pipe" },
@@ -696,6 +673,96 @@ export function getTmuxSubagentStatus(windowName: string): "running" | "complete
   } catch {
     // Process is gone
     return "completed";
+  }
+}
+
+// ---- Cleanup on Parent Exit ----
+
+/**
+ * Get all subagent window names currently in the tmux session.
+ * Excludes window 0 (dashboard).
+ */
+export function getAllSubagentWindowNames(): string[] {
+  try {
+    const output = execSync(
+      `tmux list-windows -t ${TMUX_SESSION_NAME} -F "#{window_name}"`,
+      { stdio: "pipe", encoding: "utf-8" },
+    ).trim();
+    if (!output) return [];
+    const allNames = output.split("\n").filter(Boolean);
+    // Skip the dashboard (window 0)
+    return allNames.filter(n => n !== "dashboard");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Send Ctrl+C to all subagent windows to attempt graceful stop.
+ */
+export function stopAllSubagentWindows(): void {
+  const windows = getAllSubagentWindowNames();
+  for (const window of windows) {
+    stopWindow(window);
+  }
+}
+
+/**
+ * Kill the entire tmux session (after graceful attempts).
+ */
+export function killTmuxSession(): void {
+  try {
+    execSync(`tmux kill-session -t ${TMUX_SESSION_NAME}`, { stdio: "pipe" });
+  } catch {
+    // Session may already be gone — that's fine
+  }
+}
+
+/**
+ * Orchestrates the full tmux cleanup on parent exit.
+ * Strategy: Ctrl+C all windows → wait 1s → kill the entire session.
+ * Wrapped in try/catch so tmux unavailability doesn't break parent shutdown.
+ */
+export function cleanupTmuxOnExit(): void {
+  try {
+    // Only attempt if tmux is available
+    if (!isTmuxAvailable()) return;
+
+    // Phase 1: Send Ctrl+C to all windows for graceful stop
+    stopAllSubagentWindows();
+
+    // Phase 2: Wait a brief period for graceful shutdown
+    const start = Date.now();
+    while (Date.now() - start < 1000) {
+      // Check if any windows are still alive
+      const windows = getAllSubagentWindowNames();
+      if (windows.length === 0) break;
+
+      // Check if pane PIDs are still alive
+      let allGone = true;
+      for (const window of windows) {
+        try {
+          const pid = getPanePid(window);
+          if (pid) {
+            execSync(`kill -0 ${pid} 2>/dev/null`, { stdio: "pipe" });
+            allGone = false;
+          }
+        } catch {
+          // Process gone, continue checking
+        }
+      }
+      if (allGone && windows.length === 0) break;
+
+      // Brief sleep (50ms polling)
+      const startSleep = Date.now();
+      while (Date.now() - startSleep < 50) { /* busy wait */ }
+    }
+
+    // Phase 3: Aggressively kill the entire session
+    killTmuxSession();
+  } catch {
+    // tmux may be unavailable, session already gone, etc.
+    // This must never break parent shutdown
   }
 }
 

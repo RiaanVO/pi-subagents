@@ -1753,7 +1753,7 @@ export class AgentManager {
     // Only once nothing live answers: a tombstone is a conversation to reopen,
     // and reopening one while its record still exists would fork the session.
     for (const entry of this.tombstones.values()) {
-      if (entry.handle.toLowerCase() === wanted || entry.alias?.toLowerCase() === wanted || entry.id === name) {
+      if (entry.handle?.toLowerCase() === wanted || entry.alias?.toLowerCase() === wanted || entry.id === name) {
         return { kind: "tombstone", entry };
       }
     }
@@ -1782,6 +1782,19 @@ export class AgentManager {
     return [...this.agents.values()].sort(
       (a, b) => b.startedAt - a.startedAt,
     );
+  }
+
+  /**
+   * List all agents owned by a specific parent agent.
+   *
+   * Returns every record where `parentAgentId === parentId`, sorted by
+   * start time (newest first). This is the scoped counterpart to
+   * `listAgents()` for nested agent discovery.
+   */
+  listChildren(parentId: string): AgentRecord[] {
+    return [...this.agents.values()]
+      .filter(record => record.parentAgentId === parentId)
+      .sort((a, b) => b.startedAt - a.startedAt);
   }
 
   abort(id: string): boolean {

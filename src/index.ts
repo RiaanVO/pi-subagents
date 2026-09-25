@@ -36,6 +36,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { cleanupTmuxOnExit } from "./tmux-workspace.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTransport, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -1136,6 +1137,14 @@ export default function (pi: ExtensionAPI) {
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
+
+    // Tmux cleanup: kill all subagent windows and the tmux session.
+    // Note: We intentionally do NOT add SIGINT/SIGTERM/process 'exit' handlers.
+    // The `session_shutdown` event is the single reliable cleanup point for
+    // clean parent exits. Crash scenarios leave windows running, which is
+    // acceptable tmux behavior (the user can manually clean up).
+    // See issues/parent-exit-cleanup.md for the full rationale.
+    cleanupTmuxOnExit();
   });
 
   // Live widget: show running agents above editor.

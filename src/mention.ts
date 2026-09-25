@@ -19,6 +19,8 @@
  * latest-wins, which is a different thing and not how names are allocated.
  */
 
+import { safeLowerCase } from "./lower.js";
+
 /**
  * Suggestion trigger: `@` at a token boundary plus the partial handle typed so
  * far. Ported from Claude Code, including the CJK sentence-ending punctuation
@@ -45,12 +47,12 @@ const RESERVED_HANDLES: ReadonlySet<string> = new Set(["main"]);
 
 /** Whether `@handle` names the main conversation rather than any subagent. */
 export function isReservedHandle(handle: string): boolean {
-  return RESERVED_HANDLES.has(handle.toLowerCase());
+  return RESERVED_HANDLES.has(safeLowerCase(handle));
 }
 
 /** Slug of an agent type or name, restricted to the `[\w-]` the grammar allows. */
 export function handleBase(type: string): string {
-  const slug = type.toLowerCase()
+  const slug = safeLowerCase(type)
     .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, MAX_HANDLE_LENGTH)
@@ -81,7 +83,7 @@ export function assignHandle(base: string, taken: ReadonlySet<string>): string {
  * exactly the handle its instances would be given.
  */
 export function resolveHandleToType(handle: string, types: readonly string[]): string | undefined {
-  const wanted = handle.toLowerCase();
+  const wanted = safeLowerCase(handle);
   // A type slugging to a reserved name is unaddressable rather than shadowing
   // it — `assignHandle` refuses that name too, so its instances never hold one.
   if (RESERVED_HANDLES.has(wanted)) return undefined;

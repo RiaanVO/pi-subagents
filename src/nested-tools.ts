@@ -90,6 +90,8 @@ export interface NestedAgentManager {
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
   resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  /** List all agents owned by a specific parent. */
+  listChildren(parentId: string): AgentRecord[];
 }
 
 export interface NestedToolContext {
@@ -106,6 +108,60 @@ export interface NestedToolContext {
 
 function textResult(text: string, isError = false) {
   return { content: [{ type: "text" as const, text }], isError, details: {} };
+}
+
+/**
+ * Lightweight summary of a child agent, suitable for LLM consumption.
+ * Returns only the fields needed for the resume/poll/steer cycle — no
+ * internal implementation details (worktrees, abort controllers, etc.).
+ */
+interface ListChildRecord {
+  /** Agent ID — required for all subsequent operations. */
+  id: string;
+  /** Agent type (e.g., "scout", "reviewer"). */
+  type: string;
+  /** Short description of the agent's task. */
+  description: string;
+  /** Handle/name visible to users (e.g., "@scout"). */
+  handle?: string;
+  /** Alias handle if the spawner gave it a custom name. */
+  alias?: string;
+  /** Current status. */
+  status: AgentRecord["status"];
+  /** Timestamp when the agent started running. */
+  startedAt: number;
+  /** Timestamp when the agent completed (undefined if still running). */
+  completedAt?: number;
+  /** First line of the result, truncated to 200 chars. Empty if completed with no result. */
+  resultPreview?: string;
+  /** Error message if the agent failed. */
+  error?: string;
+}
+
+/**
+ * Build a lightweight summary of a child agent record.
+ * Truncates long results to avoid overwhelming the LLM context.
+ */
+function summarizeChildRecord(record: AgentRecord): ListChildRecord {
+  const maxPreview = 200;
+  const resultPreview = record.result
+    ? record.result.length > maxPreview
+      ? record.result.slice(0, maxPreview) + "…"
+      : record.result
+    : undefined;
+
+  return {
+    id: record.id,
+    type: record.type,
+    description: record.description,
+    handle: record.handle,
+    alias: record.alias,
+    status: record.status,
+    startedAt: record.startedAt,
+    completedAt: record.completedAt,
+    resultPreview,
+    error: record.error,
+  };
 }
 
 function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): record is AgentRecord {
@@ -418,5 +474,39 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     },
   });
 
-  return [agentTool, resultTool, steerTool];
+  const listChildrenTool = defineTool({
+    name: "list_children",
+    label: "List Nested Agent Children",
+    description:
+      "List all agents owned by this parent agent, with their current status. " +
+      "Use the agent IDs returned here to resume, check results, or steer child agents.",
+    parameters: Type.Object({}),
+    execute: async () => {
+      const children = context.manager.listChildren(context.parentAgentId);
+
+      if (children.length === 0) {
+        return textResult("This agent has no owned children.");
+      }
+
+      const summaries = children.map(summarizeChildRecord);
+
+      const lines = summaries.map(
+        (c) =>
+          `- ${c.id} (${c.type}) [${c.status}]: "${c.description}"` +
+          (c.handle ? ` @${c.handle}` : "") +
+          (c.alias ? ` @${c.alias}` : "") +
+          (c.completedAt ? ` (completed)` : "") +
+          (c.error ? ` — ${c.error}` : "") +
+          (c.resultPreview ? ` — ${c.resultPreview}` : "")
+      );
+
+      return textResult(
+        `This agent owns ${children.length} child agent${
+          children.length === 1 ? "" : "s"
+        }:\n\n${lines.join("\n")}`
+      );
+    },
+  });
+
+  return [agentTool, resultTool, steerTool, listChildrenTool];
 }

@@ -587,4 +587,88 @@ but is never used during cleanup.
 
 ---
 
+# Decisions
+
+The following decisions were made during the design review on 2025-07-13.
+
+## Decision 1: Parent Exit Behavior
+
+**Question:** Should parent exit gracefully abort children, or should it leave them running (current behavior)?
+
+**Chosen: Abort all children + clean up tmux windows on clean parent exit.**
+
+**Rationale:** The current behavior (leaving children running) causes orphaned tmux windows that pile up and require manual cleanup. The abort already works for UDS children (they receive the abort command through the socket). The only missing piece is tmux window/session cleanup. This only applies to the parent's `session_shutdown` (when the user quits pi via `/quit` or similar). If the parent crashes unexpectedly, leaving children running via tmux is acceptable.
+
+## Decision 2: Tmux Cleanup Strategy
+
+**Question:** Should we clean up tmux windows on parent exit, and how?
+
+**Chosen: Hybrid approach — send Ctrl+C to each subagent window, wait 1 second, then `kill-session -t pi-subagents`.**
+
+**Rationale:** This gives children a chance to flush state and shut down gracefully, but the 1-second timeout is bounded so a hung child won't block the exit. `tmux kill-session` then removes the session (including any remaining windows) regardless.
+
+## Decision 3: Process-Level Signal Handlers
+
+**Question:** Should we add `process.on("SIGINT")`, `process.on("SIGTERM")`, or `process.on("exit")` handlers at the parent level?
+
+**Chosen: Skip for now. Rely on `pi.on("session_shutdown")` only.**
+
+**Rationale:** `session_shutdown` fires reliably when the user exits via `/quit`, the pi window closes, or pi receives its own shutdown signal. Adding `process.on()` handlers introduces risk of double-handling (pi also handles signals), race conditions on double-signal, and more code surface to test and maintain. This decision may be revisited if users report orphaned windows after terminal kill (e.g., `kill %1`). If added later, a `process.on("SIGTERM")` safety net with a guard flag would be the approach.
+
+**Note for implementation:** Add a comment in `index.ts` near the `session_shutdown` handler documenting this decision explicitly so future developers understand why signal handlers were intentionally not added.
+
+## Decision 4: Configuration Option
+
+**Question:** Should there be a config option for this behavior (e.g., `parentExitCleanup: "abort" | "detach" | "stop"`)?
+
+**Chosen: Skip config option for now. Always abort + clean up tmux on exit.**
+
+**Rationale:** The default behavior (always clean up) matches what 95% of users expect. Adding a config option would increase settings migration complexity, code surface area, and user confusion. This can be added later as a `cleanupTmuxOnExit: true | false` boolean setting if users explicitly request the ability to detach and leave agents running.
+
+---
+
 *Research completed. The key finding is that the current `session_shutdown` handler already handles UDS child abort and socket cleanup correctly. The single gap is tmux window/session cleanup, which is a straightforward addition requiring only 3 new functions in tmux-workspace.ts and ~10 lines of wiring in index.ts.*
+
+*Decisions recorded: 2025-07-13. All four design decisions resolved to minimal-scope implementation: hybrid Ctrl+C cleanup on clean exit, no signal handlers, no config.*
+
+---
+
+## Implementation (2025-07-13)
+
+**Status: ✅ Complete**
+
+### Changes Made
+
+| File | Function(s) | Description |
+|------|-------------|-------------|
+| `src/tmux-workspace.ts` | `getAllSubagentWindowNames()` | Lists all subagent windows (excludes dashboard) |
+| `src/tmux-workspace.ts` | `stopAllSubagentWindows()` | Sends Ctrl+C to all subagent windows |
+| `src/tmux-workspace.ts` | `killTmuxSession()` | Kills the entire `pi-subagents` tmux session |
+| `src/tmux-workspace.ts` | `cleanupTmuxOnExit()` | Orchestrates the full hybrid cleanup (Ctrl+C → wait 1s → kill) |
+| `src/index.ts` | `session_shutdown` handler | Calls `cleanupTmuxOnExit()` after `manager.dispose(pi)` |
+| `src/index.ts` | `session_shutdown` handler | Documents why signal handlers are intentionally omitted |
+
+### Cleanup Flow on Parent Exit
+
+```
+session_shutdown fires
+  → RPC unsubscribes
+  → scheduler.stop()
+  → workflow aborts
+  → manager.abortAll()          // aborts all UDS children
+  → manager.dispose(pi)         // cleans UDS clients, emits shutdown into children
+  → cleanupTmuxOnExit()         // Ctrl+C windows → wait 1s → kill-session
+```
+
+### Test Results
+
+- **2274 tests passed**, 7 skipped
+- **Build:** Compiled successfully
+- **Error handling:** All tmux operations wrapped in try/catch; `isTmuxAvailable()` guard prevents errors when tmux is unavailable
+
+### Implementation Notes
+
+- The Ctrl+C → 50ms polling → `kill-session` approach gives children a chance to flush state
+- The busy-wait polling with `kill -0` PID check prevents unnecessary `kill-session` if all children already exited
+- Signal handlers (SIGINT/SIGTERM/process 'exit') are intentionally NOT added — documented in-code
+- No config option needed: always clean up on exit (per Decision 4)

@@ -27,7 +27,7 @@ export function describeModel(
   model: { provider: string; id: string; name?: string },
 ): { modelName: string; modelId: string } {
   return {
-    modelName: (model.name ?? model.id).replace(/^Claude\s+/i, "").toLowerCase(),
+    modelName: ((model.name ?? model.id ?? "")).replace(/^Claude\s+/i, "").toLowerCase(),
     modelId: `${model.provider}/${model.id}`,
   };
 }

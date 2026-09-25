@@ -5,24 +5,24 @@
  * subscribes to events, waits for completion, and returns a `RunResult`.
  */
 
+import { execSync, fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { accessSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import net from "node:net";
-import { execSync, fork } from "node:child_process";
 import type { AgentSession, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { getAgentConfig, getConfig, getToolNamesForType } from "./agent-types.js";
-import { detectEnv } from "./env.js";
 import {
-  resolveDefaultModel,
-  resolveEffectiveMaxTurns,
   type RunOptions,
   type RunResult,
+  resolveDefaultModel,
+  resolveEffectiveMaxTurns,
   type ToolActivity,
 } from "./agent-runner.js";
+import { getAgentConfig, getToolNamesForType } from "./agent-types.js";
+import { detectEnv } from "./env.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 
@@ -61,7 +61,7 @@ const CONNECT_TIMEOUT_MS = 5_000;
 /** Resolve the session directory for a child process. */
 function resolveSessionDir(
   agentConfig: ReturnType<typeof getAgentConfig>,
-  cwd: string,
+  _cwd: string,
 ): string | undefined {
   if (agentConfig?.sessionDir) {
     const dir = agentConfig.sessionDir;
@@ -116,7 +116,7 @@ export async function runViaUds(
   // We only need it for the child env; the pi instance isn't available here
   // but detectEnv is needed for the child process env setup.
   // In UDS mode, the child handles its own env detection from its cwd.
-  const env = options.pi ? await detectEnv(options.pi, effectiveCwd) : undefined;
+  const _env = options.pi ? await detectEnv(options.pi, effectiveCwd) : undefined;
 
   const agentDir = getAgentDir();
   const sessionDir = resolveSessionDir(agentConfig, effectiveCwd);
@@ -130,7 +130,6 @@ export async function runViaUds(
   const projectRoot = join(moduleDir, "..");
   const UDS_SERVER_PATH = join(projectRoot, "dist", "uds-server.js");
   const UDS_CHILD_PATH  = join(projectRoot, "src", "uds-child.mjs");
-  const TSC_PATH        = join(projectRoot, "node_modules", ".bin", "tsc");
 
   function ensureUDSServerCompiled(): void {
     try { accessSync(UDS_SERVER_PATH); return; } catch { /* missing — compile below */ }
@@ -213,7 +212,7 @@ export async function runViaUds(
     child.once("error", (_err: unknown) => resolve({ code: null, signal: null }));
   });
 
-  let socketReady = false;
+  let _socketReady = false;
   const pollPromise = new Promise<void>((resolve, reject) => {
     let elapsed = 0;
     const timer = setInterval(() => {
@@ -221,7 +220,7 @@ export async function runViaUds(
       try {
         // Check if socket file exists
         accessSync(socketPath);
-        socketReady = true;
+        _socketReady = true;
         clearInterval(timer);
         resolve();
       } catch {
@@ -282,8 +281,8 @@ export async function runViaUds(
 
   // State tracking for the result
   let responseText = "";
-  let turnCount = 0;
-  let toolUses = 0;
+  let _turnCount = 0;
+  let _toolUses = 0;
   let completed = false;
   let aborted = false;
   let error: string | undefined;
@@ -301,7 +300,7 @@ export async function runViaUds(
             readyReceived = true;
           }
           handleChildEvent(msg);
-        } catch (parseErr) {
+        } catch (_parseErr) {
           // Silently skip malformed messages
         }
       }
@@ -319,13 +318,13 @@ export async function runViaUds(
   function handleChildEvent(msg: ChildMessage): void {
     switch (msg.type) {
       case "turn_start": {
-        turnCount++;
+        _turnCount++;
         break;
       }
 
       case "turn_end": {
         // turn_end may carry a final turnCount
-        if (msg.turnCount != null) turnCount = msg.turnCount;
+        if (msg.turnCount != null) _turnCount = msg.turnCount;
         break;
       }
 
@@ -336,7 +335,7 @@ export async function runViaUds(
       }
 
       case "tool_execution_start": {
-        toolUses++;
+        _toolUses++;
         options.onToolActivity?.({ type: "start", toolName: msg.toolName as string });
         break;
       }
@@ -484,7 +483,7 @@ export async function runViaUds(
   // If childCompletionPromise didn't already resolve, ensure it does
   if (!completed) {
     await cleanupSocket(socketPath);
-    const { code, signal } = await childExited;
+    await childExited; // destructuring { code, signal } unused here
     return buildResult();
   }
 
@@ -540,7 +539,7 @@ async function cleanupSocket(socketPath: string): Promise<void> {
 export async function connectToUdsSocket(
   socketPath: string,
   prompt: string,
-  config: { agentType: SubagentType; model: any; thinkingLevel: ThinkingLevel | undefined; maxTurns: number | undefined; toolNames: string[] },
+  _config: { agentType: SubagentType; model: any; thinkingLevel: ThinkingLevel | undefined; maxTurns: number | undefined; toolNames: string[] },
   options: {
     onTextDelta?: (delta: string, fullText: string) => void;
     onToolActivity?: (activity: ToolActivity) => void;
@@ -550,14 +549,14 @@ export async function connectToUdsSocket(
   },
 ): Promise<UdsRunResult> {
   // ── 1. Poll for socket existence ────────────────────────────────────
-  let socketReady = false;
+  let _socketReady = false;
   await new Promise<void>((resolve, reject) => {
     let elapsed = 0;
     const timer = setInterval(() => {
       elapsed += SOCKET_POLL_INTERVAL_MS;
       try {
         accessSync(socketPath);
-        socketReady = true;
+        _socketReady = true;
         clearInterval(timer);
         resolve();
       } catch {
@@ -587,8 +586,8 @@ export async function connectToUdsSocket(
   let buffer = "";
   let readyReceived = false;
   let responseText = "";
-  let turnCount = 0;
-  let toolUses = 0;
+  let _turnCount = 0;
+  let _toolUses = 0;
   let completed = false;
   let aborted = false;
   let error: string | undefined;
@@ -622,12 +621,12 @@ export async function connectToUdsSocket(
   function handleChildEvent(msg: ChildMessage): void {
     switch (msg.type) {
       case "turn_start": {
-        turnCount++;
+        _turnCount++;
         break;
       }
 
       case "turn_end": {
-        if (msg.turnCount != null) turnCount = msg.turnCount;
+        if (msg.turnCount != null) _turnCount = msg.turnCount;
         break;
       }
 
@@ -638,7 +637,7 @@ export async function connectToUdsSocket(
       }
 
       case "tool_execution_start": {
-        toolUses++;
+        _toolUses++;
         options.onToolActivity?.({ type: "start", toolName: msg.toolName as string });
         break;
       }
