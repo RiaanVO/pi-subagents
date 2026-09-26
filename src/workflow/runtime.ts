@@ -18,6 +18,7 @@ import { Worker } from "node:worker_threads";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
+import { PauseGate } from "./pause-gate.js";
 import type { WorkflowAgentEntry, WorkflowEntry } from "./progress.js";
 import { WORKER_SOURCE } from "./worker-source.js";
 
@@ -659,33 +660,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
    */
   let spentOutputTokens = 0;
 
-  let paused = false;
-  /** Read through a call for the same reason `intent()` is — see below. */
-  const isPaused = () => paused;
-  const pauseWaiters = new Set<() => void>();
-  /** Release everyone held at a pause — on resume, and on the way out. */
-  function releasePause(): void {
-    for (const wake of [...pauseWaiters]) wake();
-    pauseWaiters.clear();
-  }
-  /** Park here while the run is paused, so no new agent is started. */
-  function pauseGate(live: LiveAgent): Promise<void> {
-    if (!paused || aborted || settled) return Promise.resolve();
-    return new Promise<void>(resolve => {
-      const wake = () => {
-        pauseWaiters.delete(wake);
-        live.wake = undefined;
-        resolve();
-      };
-      live.wake = wake;
-      pauseWaiters.add(wake);
-    });
-  }
+  const pauseGateState = new PauseGate();
 
   options.onControl?.({
-    pause: () => { paused = true; },
-    resume: () => { paused = false; releasePause(); },
-    isPaused: () => paused,
+    pause: () => { pauseGateState.pause(); },
+    resume: () => { pauseGateState.resume(); },
+    isPaused: () => pauseGateState.isPaused(),
     skip: index => {
       const live = liveAgents.get(index);
       if (live === undefined || live.intent !== undefined) return false;
@@ -752,7 +732,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       // it observes the settle and unwinds. Nothing depends on it — the run's
       // promise resolves either way — it just does not leave live-agent
       // bookkeeping behind for a run that is over.
-      releasePause();
+      pauseGateState.resume();
       for (const agentId of inflight) host.abortAgent(agentId);
       inflight.clear();
       semaphore.drain();
@@ -947,7 +927,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         for (;;) {
           // Held before the slot, not after: a paused run must not sit on
           // concurrency it is not using while its running agents drain.
-          await pauseGate(live);
+          await pauseGateState.waitForResume(live);
           if (intent() === "skip") return settleSkipped({});
 
           // A resumed agent waits its turn like any other: it is the same amount of
@@ -962,7 +942,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           // permit when the pause landed, so it never passed the gate above.
           // Hand the permit back and go wait at the gate like everything else,
           // or a pause would leak exactly as many agents as were queued.
-          if (isPaused() && !aborted && !settled) {
+          if (pauseGateState.isPaused() && !aborted && !settled) {
             semaphore.release();
             continue;
           }
