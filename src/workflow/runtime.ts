@@ -16,6 +16,7 @@
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
+import { JournalReplayer } from "./journal-replayer.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
 import { PauseGate } from "./pause-gate.js";
@@ -685,16 +686,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     },
   });
 
-  /** The journal entry to reuse at `index`, or undefined to run it live. */
-  function replayAt(index: number, key: string): WorkflowJournalEntry | undefined {
-    if (!prefixIntact) return undefined;
-    const entry = journalEntries[index];
-    if (entry === undefined || entry.index !== index || entry.key !== key || !entry.ok) {
-      prefixIntact = false;
-      return undefined;
-    }
-    return entry;
-  }
+  /** Prefix-aware journal replayer for this run. */
+  const journalReplayer = new JournalReplayer(
+    journalEntries,
+    { value: prefixIntact },
+    () => { prefixIntact = false; },
+  );
 
   const worker = new Worker(WORKER_SOURCE, {
     eval: true,
@@ -888,7 +885,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           ...payload,
           schema: payload.schema !== undefined ? JSON.stringify(payload.schema) : undefined,
         };
-        let replayed = replayAt(index, journalKey(keyInput));
+        let replayed = journalReplayer.tryAt(index, journalKey(keyInput));
         // A replayed answer still has to satisfy the schema. The key covers a
         // schema that *changed*, but not a journal that was hand-edited, and not
         // the empty text a torn entry leaves behind — either would hand the
