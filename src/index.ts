@@ -75,6 +75,7 @@ import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkf
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
+import { createActivityTracker } from "./shared/activity-tracker.js";
 import { handleForegroundSpawn, handleBackgroundSpawn, handleSchedule, handleResume, type AgentDispatchContext } from "./agent-dispatch.js";
 import type { ThinkingLevel, IsolationMode } from "./types.js";
 
@@ -101,53 +102,6 @@ export function renderRunningAgentStatus(
 function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
   const t = getLifetimeTotal(o.lifetimeUsage);
   return t > 0 ? formatTokens(t) : "";
-}
-
-/**
- * Create an AgentActivity state and spawn callbacks for tracking tool usage.
- * Used by both foreground and background paths to avoid duplication.
- */
-function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
-  const state: AgentActivity = {
-    activeTools: new Map(),
-    toolUses: 0,
-    turnCount: 1,
-    maxTurns,
-    responseText: "",
-    session: undefined,
-  };
-
-  const callbacks = {
-    onToolActivity: (activity: { type: "start" | "end"; toolName: string }) => {
-      if (activity.type === "start") {
-        state.activeTools.set(activity.toolName + "_" + Date.now(), activity.toolName);
-      } else {
-        for (const [key, name] of state.activeTools) {
-          if (name === activity.toolName) { state.activeTools.delete(key); break; }
-        }
-        state.toolUses++;
-      }
-      onStreamUpdate?.();
-    },
-    onTextDelta: (_delta: string, fullText: string) => {
-      state.responseText = fullText;
-      onStreamUpdate?.();
-    },
-    onTurnEnd: (turnCount: number) => {
-      state.turnCount = turnCount;
-      onStreamUpdate?.();
-    },
-    onSessionCreated: (session: any) => {
-      state.session = session;
-    },
-    // Spend is accumulated on the AgentRecord (agent-manager), which is what
-    // every surface reads; this callback exists here only to repaint on it.
-    onAssistantUsage: (_usage: LifetimeUsage) => {
-      onStreamUpdate?.();
-    },
-  };
-
-  return { state, callbacks };
 }
 
 /**
