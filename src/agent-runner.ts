@@ -47,6 +47,77 @@ export const SUBAGENT_TOOL_NAMES = {
 /** Names of tools registered by this extension that subagents must NOT inherit. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
 
+/** Result of tool-scope assembly for a subagent session. */
+interface SessionToolScope {
+  /** Static allowlist — used when no extensions are loaded. */
+  tools?: string[];
+  /** Permanent denylist — used when extensions are loaded. */
+  excludeTools?: string[];
+}
+
+/**
+ * Assemble the tool allowlist / denylist for a subagent session.
+ *
+ * Tools are scoped in one of two ways:
+ *   • `noExtensions: true` → static allowlist (`tools:`) — nothing can
+ *     register asynchronously, so pi's `allowedToolNames` gates both
+ *     registration and the initial active set.
+ *   • `noExtensions: false` → live scoping — `allowedToolNames` is left
+ *     unset so pi's live `isAllowedTool` admits tools whenever they
+ *     register; `excludeTools` carries the name-stable permanent scope
+ *     (our orchestration tools, built-ins the agent didn't ask for, and
+ *     `disallowedTools`), which pi re-applies on every registry refresh.
+ *
+ * @returns An object with either `tools` (allowlist) or `excludeTools`
+ *          (denylist), never both.
+ */
+export function assembleSessionToolScope(options: {
+  noExtensions: boolean;
+  disallowedSet?: Set<string>;
+  toolNames: string[];
+  nestedToolNames: Set<string>;
+  structuredToolNames: Set<string>;
+}): SessionToolScope {
+  const { noExtensions, disallowedSet, toolNames, nestedToolNames, structuredToolNames } = options;
+  const builtinToolNameSet = new Set(toolNames);
+
+  if (noExtensions) {
+    // Strict allowlist: built-ins the agent asked for, plus any opt-in nested
+    // tools (whose names would otherwise be dropped as EXCLUDED_TOOL_NAMES).
+    return {
+      tools: [
+        ...toolNames.filter(
+          (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
+        ),
+        ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
+        // Not filtered through `disallowedSet`, unlike the nested tools above:
+        // the caller asked for a schema, and removing the only tool that can
+        // satisfy it would make the request unsatisfiable by construction rather
+        // than merely restricted.
+        ...structuredToolNames,
+      ],
+    };
+  } else {
+    // Deny the orchestration tools EXCEPT the nested ones this agent opted into —
+    // those are injected as customTools and must survive the registry gate.
+    const denyTools = new Set<string>(
+      EXCLUDED_TOOL_NAMES.filter((t) => !nestedToolNames.has(t)),
+    );
+    // Keep only the built-ins the agent asked for — deny the rest.
+    for (const name of BUILTIN_TOOL_NAMES) {
+      if (!builtinToolNameSet.has(name)) denyTools.add(name);
+    }
+    if (disallowedSet) {
+      // disallowed_tools wins even over an opt-in nested tool of the same name.
+      // Not over StructuredOutput, though — see the allowlist branch above.
+      for (const name of disallowedSet) {
+        if (!structuredToolNames.has(name)) denyTools.add(name);
+      }
+    }
+    return { excludeTools: [...denyTools] };
+  }
+}
+
 /**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
  * Lowercased — extension names match case-insensitively so `extensions: [Mcp]`
@@ -892,70 +963,14 @@ export async function runAgent(
     ...structuredToolNames,
   ]);
 
-  // ─── Tool scoping ───────────────────────────────────────────────────────
-  //
-  // Some extensions register their tools ASYNCHRONOUSLY, long after the
-  // `loader.reload()` above: pi-mcp calls registerTool from `session_start`
-  // (once its MCP servers connect), context-mode from `before_agent_start`.
-  // That is deliberate on their part — eagerly spawning an MCP bridge during
-  // extension discovery orphans child processes on pi's non-agent code paths
-  // (--help, config, trust probing).
-  //
-  // So the tool set cannot be snapshotted here. pi's `allowedToolNames` gates
-  // tool *registration* (`_refreshToolRegistry`'s `isAllowedTool`), not merely
-  // the active set, and is frozen at construction — a name absent from the
-  // snapshot is dropped forever, even once the tool actually registers (#125).
-  //
-  // Whenever extensions are in play we therefore:
-  //   - leave `allowedToolNames` unset, so pi's live gate admits tools whenever
-  //     they register;
-  //   - express the name-stable, permanent part of the scope (our own
-  //     orchestration tools, built-ins the agent didn't ask for, and
-  //     `disallowedTools`) as `excludeTools`, which pi re-applies on every
-  //     registry refresh;
-  //   - enforce `ext:` narrowing on the ACTIVE set via the live `inScope()`
-  //     predicate installed after bind — the active set is what the LLM sees,
-  //     so a registry tool that is never activated is invisible and uncallable.
-  //
-  // `noExtensions`/`isolated` keeps the historical static allowlist: nothing
-  // async can appear there, and a hard registry gate is the correct boundary.
-  const builtinToolNameSet = new Set(toolNames);
-
-  let sessionTools: string[] | undefined;
-  let sessionExcludeTools: string[] | undefined;
-  if (noExtensions) {
-    // Strict allowlist: built-ins the agent asked for, plus any opt-in nested
-    // tools (whose names would otherwise be dropped as EXCLUDED_TOOL_NAMES).
-    sessionTools = [
-      ...toolNames.filter(
-        (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
-      ),
-      ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
-      // Not filtered through `disallowedSet`, unlike the nested tools above:
-      // the caller asked for a schema, and removing the only tool that can
-      // satisfy it would make the request unsatisfiable by construction rather
-      // than merely restricted.
-      ...structuredToolNames,
-    ];
-  } else {
-    // Deny the orchestration tools EXCEPT the nested ones this agent opted into —
-    // those are injected as customTools and must survive the registry gate.
-    const denyTools = new Set<string>(
-      EXCLUDED_TOOL_NAMES.filter((t) => !nestedToolNames.has(t)),
-    );
-    // Keep only the built-ins the agent asked for — deny the rest.
-    for (const name of BUILTIN_TOOL_NAMES) {
-      if (!builtinToolNameSet.has(name)) denyTools.add(name);
-    }
-    if (disallowedSet) {
-      // disallowed_tools wins even over an opt-in nested tool of the same name.
-      // Not over StructuredOutput, though — see the allowlist branch above.
-      for (const name of disallowedSet) {
-        if (!structuredToolNames.has(name)) denyTools.add(name);
-      }
-    }
-    sessionExcludeTools = [...denyTools];
-  }
+  // Assemble the session tool scope (allowlist for no-extensions, denylist otherwise).
+  const { tools: sessionTools, excludeTools: sessionExcludeTools } = assembleSessionToolScope({
+    noExtensions,
+    disallowedSet,
+    toolNames,
+    nestedToolNames,
+    structuredToolNames,
+  });
 
   const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
