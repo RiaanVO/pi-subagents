@@ -75,6 +75,8 @@ import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkf
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
+import { handleForegroundSpawn, handleBackgroundSpawn, handleSchedule, handleResume, type AgentDispatchContext } from "./agent-dispatch.js";
+import type { ThinkingLevel, IsolationMode } from "./types.js";
 
 // ---- Shared helpers ----
 
@@ -1967,350 +1969,45 @@ Terse command-style prompts produce shallow, generic work.
         };
       };
 
-      // ---- Schedule: register a job, don't spawn now ----
+      // Build dispatch context for handler functions
+      const dispatchCtx: AgentDispatchContext = {
+        manager,
+        pi,
+        widget,
+        fleet,
+        agentActivity,
+        scheduler,
+        groupJoin,
+        createActivityTracker,
+        isSchedulingEnabled,
+        isTopLevelAgent,
+        defaultJoinMode,
+        currentBatchAgents,
+        batchFinalizeTimer,
+        setBatchFinalizeTimer: (t) => { batchFinalizeTimer = t; },
+        batchCounter,
+        setBatchCounter: (n) => { batchCounter = n; },
+        finalizeBatch,
+        sendIndividualNudge,
+        startBackgroundResume,
+        buildDetails,
+        detailBaseFor,
+        getDisplayName,
+        getLifetimeCost,
+        formatLifetimeTokens,
+      };
+
+      // Dispatch to the appropriate handler
       if (params.schedule) {
-        if (!isSchedulingEnabled()) {
-          return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
-        }
-        if (params.resume) {
-          return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
-        }
-        if (params.inherit_context) {
-          return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
-        }
-        if (params.run_in_background === false) {
-          return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
-        }
-        if (!scheduler.isActive()) {
-          return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
-        }
-        try {
-          const job = scheduler.addJob({
-            name: params.description as string,
-            description: params.description as string,
-            schedule: params.schedule as string,
-            // The caller's own name, not the substitute — the scheduler re-resolves
-            // at fire time, and the original is what a user edits.
-            subagent_type: requestedType,
-            prompt: params.prompt as string,
-            model: params.model as string | undefined,
-            thinking: thinking,
-            max_turns: effectiveMaxTurns,
-            isolated: isolated,
-            isolation: isolation,
-          });
-          const next = scheduler.getNextRun(job.id);
-          return textResult(
-            `${fallbackNote}Scheduled "${job.name}" (id: ${job.id}, type: ${job.scheduleType}). ` +
-            `Next run: ${next ?? "(unknown)"}. ` +
-            `Manage via /agents → Scheduled jobs.`,
-          );
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
-        }
+        return handleSchedule(params, ctx, signal, onUpdate, dispatchCtx, fallbackNote, requestedType, thinking as ThinkingLevel | undefined, effectiveMaxTurns, isolated, isolation as IsolationMode | undefined);
       }
-
-      // Resume existing agent
       if (params.resume) {
-        const existing = manager.getRecord(params.resume);
-        if (!existing || !isTopLevelAgent(existing)) {
-          return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
-        }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
-        }
-
-        // Background resume: detached run that notifies on completion, mirroring
-        // a background spawn. Previously run_in_background was silently ignored
-        // on resume (this branch returned before the background branch below),
-        // so a resumed agent always blocked the main loop until it finished.
-        if (runInBackground) {
-          const id = existing.id;
-          // A detached resume hands control back while the record stays
-          // "running", so nothing stops the model from resuming the same agent
-          // again mid-run. manager.resume() refuses that (it would orphan the
-          // live run's abort controller); say why here, where the model can act
-          // on it, instead of letting it read as a generic failure.
-          if (existing.status === "running" || existing.status === "queued") {
-            return textResult(
-              `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
-            );
-          }
-
-          const record = await startBackgroundResume(ctx, existing, params.prompt, {
-            outputTranscript,
-            maxTurns: effectiveMaxTurns,
-            toolCallId,
-          });
-          if (!record) {
-            return textResult(`Failed to resume agent "${params.resume}".`);
-          }
-
-          const isQueued = record.status === "queued";
-          return textResult(
-            `Agent ${isQueued ? "queued" : "resumed"} in background.\n` +
-            `Agent ID: ${id}\n` +
-            `Type: ${existing.type}\n` +
-            (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-            (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-            `\nYou will be notified when this agent completes.\n` +
-            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
-            { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
-          );
-        }
-
-        const record = await manager.resume(params.resume, params.prompt, signal);
-        if (!record) {
-          return textResult(`Failed to resume agent "${params.resume}".`);
-        }
-        // A failed resume surfaces the error, plus any partial output THIS
-        // resume produced (never the previous turn's answer, #144).
-        if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
-        }
-        return textResult(
-          record.result?.trim() || "No output.",
-          buildDetails(detailBaseFor(record), record),
-        );
+        return await handleResume(params, ctx, signal, onUpdate, dispatchCtx, fallbackNote, toolCallId, outputTranscript, effectiveMaxTurns);
       }
-
-      // Background execution
       if (runInBackground) {
-        const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
-
-        // Wrap onSessionCreated to wire output file streaming.
-        // The callback lazily reads record.outputFile (set right after spawn)
-        // rather than closing over a value that doesn't exist yet.
-        let id: string;
-        const origBgOnSession = bgCallbacks.onSessionCreated;
-        bgCallbacks.onSessionCreated = (session: any) => {
-          origBgOnSession(session);
-          const rec = manager.getRecord(id);
-          if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
-          }
-        };
-
-        // A throw here means the agent never started. Let it out: pi marks a
-        // tool call failed only when execute throws, and a returned message
-        // reads to the model as a subagent that ran and reported this (#179).
-        id = manager.spawn(pi, ctx, subagentType, params.prompt, {
-          description: params.description,
-          name: params.name as string | undefined,
-          model,
-          maxTurns: effectiveMaxTurns,
-          isolated,
-          inheritContext,
-          thinkingLevel: thinking,
-          isBackground: true,
-          isolation,
-          transport,
-          tmuxEnabled,
-          invocation: agentInvocation,
-          rootSessionId: ctx.sessionManager.getSessionId(),
-          ...bgCallbacks,
-        });
-
-        // Set output file + join mode synchronously after spawn, before the
-        // event loop yields — onSessionCreated is async so this is safe.
-        const joinMode = resolveJoinMode(defaultJoinMode, true);
-        const record = manager.getRecord(id);
-        if (record && joinMode) {
-          record.joinMode = joinMode;
-          record.toolCallId = toolCallId;
-          attachTranscript(record, id);
-        }
-
-        // With isolation: "worktree" the agent isn't running yet — the repo
-        // copy is an awaited git call. Wait for it here, after the synchronous
-        // wiring above, so a strict-isolation failure still fails THIS tool
-        // call instead of being reported as a subagent that ran (#179).
-        await manager.awaitStartup(id);
-
-        if (joinMode == null || joinMode === 'async') {
-          // Foreground/no join mode or explicit async — not part of any batch
-        } else {
-          // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
-          // Debounce: reset timer on each new agent so parallel tool calls
-          // dispatched across multiple event loop ticks are captured together
-          if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-          batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-        }
-
-        agentActivity.set(id, bgState);
-        widget.ensureTimer();
-        widget.update();
-        fleet.ensureTimer();
-        fleet.update();
-
-        // Emit created event
-        pi.events.emit("subagents:created", {
-          id,
-          type: subagentType,
-          description: params.description,
-          isBackground: true,
-        });
-
-        const isQueued = record?.status === "queued";
-        return textResult(
-          `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
-          `Agent ID: ${id}\n` +
-          `Type: ${displayName}\n` +
-          `Description: ${params.description}\n` +
-          (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-          (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nYou will be notified when this agent completes.\n` +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
-          `Do not duplicate this agent's work.`,
-          { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
-        );
+        return await handleBackgroundSpawn(params, ctx, signal, onUpdate, dispatchCtx, fallbackNote, toolCallId, subagentType, model, effectiveMaxTurns, isolated, inheritContext, thinking as ThinkingLevel | undefined, isolation as IsolationMode | undefined, transport, tmuxEnabled, agentInvocation, outputTranscript);
       }
-
-      // Foreground (synchronous) execution — stream progress via onUpdate
-      let spinnerFrame = 0;
-      const startedAt = Date.now();
-      let fgId: string | undefined;
-      // Set only while the spawn is parked on a foreground concurrency slot
-      // (maxConcurrentForeground); undefined the rest of the time, including
-      // always when the limit is unset.
-      let queuedAhead: number | undefined;
-
-      const streamUpdate = () => {
-        // Spend from the record, everything else from the live tracker. `fgId`
-        // is set in onSessionCreated below, which fires before the first
-        // assistant message — so nothing is spent while this reads zero.
-        const fgRecord = fgId ? manager.getRecord(fgId) : undefined;
-        const details: AgentDetails = {
-          ...detailBaseFor(fgRecord),
-          toolUses: fgState.toolUses,
-          tokens: fgRecord ? formatLifetimeTokens(fgRecord) : "",
-          cost: fgRecord ? getLifetimeCost(fgRecord.lifetimeUsage) : 0,
-          turnCount: fgState.turnCount,
-          maxTurns: fgState.maxTurns,
-          durationMs: Date.now() - startedAt,
-          // Deliberately still "running" while queued: the renderer routes any
-          // status it doesn't know to raw text (see the catch-all below), which
-          // would drop the spinner and read as hung. Only the activity line
-          // changes — "thinking…" would be a lie for an agent that has not
-          // started and may not for minutes.
-          status: "running",
-          activity: queuedAhead === undefined
-            ? describeActivity(fgState.activeTools, fgState.responseText)
-            : `queued — waiting for a foreground slot${queuedAhead > 0 ? ` (${queuedAhead} ahead)` : ""}`,
-          spinnerFrame: spinnerFrame % SPINNER.length,
-        };
-        onUpdate?.({
-          content: [{ type: "text", text: `${fgState.toolUses} tool uses...` }],
-          details: details as any,
-        });
-      };
-
-      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns, streamUpdate);
-
-      // Wire session creation: register in widget + stream to output file.
-      // The output file path is set synchronously after spawn (below),
-      // before onSessionCreated fires — same pattern as background agents.
-      const origOnSession = fgCallbacks.onSessionCreated;
-      fgCallbacks.onSessionCreated = (session: any) => {
-        origOnSession(session);
-        // It really started — stop reporting it as queued, and repaint now
-        // rather than leaving the stale line up for the next spinner tick.
-        // Guarded, so a spawn that never queued emits no extra update.
-        if (queuedAhead !== undefined) {
-          queuedAhead = undefined;
-          streamUpdate();
-        }
-        for (const a of manager.listAgents()) {
-          if (a.session === session) {
-            fgId = a.id;
-            agentActivity.set(a.id, fgState);
-            widget.ensureTimer();
-            fleet.ensureTimer();
-            fleet.update();
-            break;
-          }
-        }
-        // Stream conversation to output file (foreground agent logging)
-        if (fgId) {
-          const rec = manager.getRecord(fgId);
-          if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, ctx.cwd);
-          }
-        }
-      };
-
-      // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
-      const spinnerInterval = setInterval(() => {
-        spinnerFrame++;
-        streamUpdate();
-      }, 80);
-
-      streamUpdate();
-
-      let record: AgentRecord;
-      try {
-        const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
-          description: params.description,
-          name: params.name as string | undefined,
-          model,
-          maxTurns: effectiveMaxTurns,
-          isolated,
-          inheritContext,
-          thinkingLevel: thinking,
-          isolation,
-          transport,
-          invocation: agentInvocation,
-          signal,
-          rootSessionId: ctx.sessionManager.getSessionId(),
-          // Deliberately does NOT set fgId: that drives agentActivity, the
-          // widget and the `finally` cleanup below, none of which should see an
-          // agent that has no session and may never get one.
-          onQueued: (_id, ahead) => { queuedAhead = ahead; streamUpdate(); },
-          ...fgCallbacks,
-        }, (fgAgentId) => {
-          // onSpawned: called synchronously after spawn, before onSessionCreated fires.
-          // Set up the output file so streamToOutputFile can pick it up.
-          const fgRec = manager.getRecord(fgAgentId);
-          attachTranscript(fgRec, fgAgentId);
-        });
-        record = fgResult.record;
-      } finally {
-        // Runs on both paths, so a startup throw — which now propagates, see
-        // the background spawn above (#179) — no longer leaves the spinner
-        // ticking or a finished agent on the widget.
-        clearInterval(spinnerInterval);
-        if (fgId) {
-          agentActivity.delete(fgId);
-          widget.markFinished(fgId);
-          fleet.onAgentFinished(fgId);
-        }
-      }
-
-      // Get final token count — from the record, like the cost below it, so the
-      // two describe the same work when the agent delegated to nested children.
-      const tokenText = formatLifetimeTokens(record);
-
-      const details = buildDetails(detailBaseFor(record), record, fgState, { tokens: tokenText });
-
-      if (record.status === "error") {
-        // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
-      }
-
-      const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
-      const statsParts = [`${record.toolUses} tool uses`];
-      if (tokenText) statsParts.push(tokenText);
-      if (showCost) {
-        const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
-        if (costText) statsParts.push(costText);
-      }
-      return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
-        (record.result?.trim() || "No output."),
-        details,
-      );
+      return await handleForegroundSpawn(params, ctx, signal, onUpdate, dispatchCtx, fallbackNote, subagentType, model, effectiveMaxTurns, isolated, inheritContext, thinking as ThinkingLevel | undefined, isolation as IsolationMode | undefined, transport, agentInvocation, outputTranscript, showCost);
     },
   });
   /**
