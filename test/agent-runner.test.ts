@@ -36,24 +36,6 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   // Identity, as pi's own is: `defineTool` exists for the type inference, and
   // the structured-output tool is built through it.
   defineTool: (definition: unknown) => definition,
-  createStructuredOutputTool: (compiled: any, capture: any) => ({
-    name: "StructuredOutput",
-    execute: async (_toolCallId: string, params: unknown) => {
-      capture.called = true;
-      const verdict = compiled.check(params);
-      if (verdict !== true) {
-        capture.lastError = verdict;
-        return {
-          content: [{ type: "text", text: `StructuredOutput did not match the required schema:\n${verdict}\nCall it again with a corrected value.` }],
-          isError: true,
-          details: {},
-        };
-      }
-      capture.json = JSON.stringify(params);
-      capture.lastError = undefined;
-      return { content: [{ type: "text", text: "Recorded." }], details: {} };
-    },
-  }),
   // Mock loader simulates pi-mono: reload() applies additionalExtensionPaths
   // (an unknown path becomes an error row, mirroring a failed load) and then
   // runs extensionsOverride over the result.
