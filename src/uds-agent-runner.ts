@@ -25,6 +25,7 @@ import { getAgentConfig, getToolNamesForType } from "./agent-types.js";
 import { detectEnv } from "./env.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
+import { handleChildEvent, type ChildEventCallbacks, type ChildEventState, type ChildMessage } from "./shared/handle-child-event.js";
 
 /**
  * Callback fired once the client socket is connected and ready to receive
@@ -124,7 +125,7 @@ export async function runViaUds(
   // ─── 1.5 Ensure UDS server is compiled (auto-build if needed) ───────────
 
   // The child process imports `../dist/uds-server.js`. In production (after `npm
-  // run build`) this file exists. In development (running via `-e ./src/index.ts`
+  // run build`) this file exists. In development (running via `-e ./index.ts`
   // or from a pre-bundled extension) it may not — so we compile on demand.
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const projectRoot = join(moduleDir, "..");
@@ -194,12 +195,33 @@ export async function runViaUds(
     detached: false,
   });
 
+  // ─── Event state and callbacks for handleChildEvent ──────────────────────
+  // Defined early so the IPC handler can set error state.
+  const eventState: ChildEventState = {
+    responseText: "",
+    turnCount: 0,
+    completed: false,
+    aborted: false,
+    error: undefined,
+  };
+  const eventCallbacks: ChildEventCallbacks = {
+    onTextDelta: options.onTextDelta,
+    onToolActivity: options.onToolActivity,
+    onAssistantUsage: options.onAssistantUsage,
+    onCompaction: options.onCompaction,
+  };
+
+  /** Handle events from child, mapping to RunOptions callbacks. */
+  function handleChildEventMsg(msg: ChildMessage): void {
+    handleChildEvent(msg, eventCallbacks, eventState);
+  }
+
   // ─── 4.5 IPC error handler — captures child crash reasons ────────────
   // The child sends process.send({ type: 'child_error', message }) before exiting.
   // This prevents silent child crashes where the parent only sees 'exit' with no cause.
   child.on("message", (msg: any) => {
     if (msg?.type === "child_error") {
-      error = msg.message ?? "child error (no message)";
+      eventState.error = msg.message ?? "child error (no message)";
       // Store in the result; no dedicated callback in RunOptions, but the
       // parent can inspect `result.failure` to see why the child failed.
     }
@@ -279,14 +301,6 @@ export async function runViaUds(
   let buffer = "";
   let readyReceived = false;
 
-  // State tracking for the result
-  let responseText = "";
-  let _turnCount = 0;
-  let _toolUses = 0;
-  let completed = false;
-  let aborted = false;
-  let error: string | undefined;
-
   client.on("data", (data: Buffer) => {
     buffer += data.toString();
     const lines = buffer.split("\n");
@@ -299,7 +313,7 @@ export async function runViaUds(
           if (msg.type === "ready" && !readyReceived) {
             readyReceived = true;
           }
-          handleChildEvent(msg);
+          handleChildEventMsg(msg);
         } catch (_parseErr) {
           // Silently skip malformed messages
         }
@@ -311,84 +325,6 @@ export async function runViaUds(
   function sendCommand(command: Record<string, unknown>): void {
     if (!client.destroyed && !client.writableEnded) {
       client.write(JSON.stringify(command) + "\n");
-    }
-  }
-
-  /** Handle events from child, mapping to RunOptions callbacks. */
-  function handleChildEvent(msg: ChildMessage): void {
-    switch (msg.type) {
-      case "turn_start": {
-        _turnCount++;
-        break;
-      }
-
-      case "turn_end": {
-        // turn_end may carry a final turnCount
-        if (msg.turnCount != null) _turnCount = msg.turnCount;
-        break;
-      }
-
-      case "text_delta": {
-        responseText += msg.delta;
-        options.onTextDelta?.(msg.delta as string, responseText);
-        break;
-      }
-
-      case "tool_execution_start": {
-        _toolUses++;
-        options.onToolActivity?.({ type: "start", toolName: msg.toolName as string });
-        break;
-      }
-
-      case "tool_execution_end": {
-        options.onToolActivity?.({ type: "end", toolName: msg.toolName as string });
-        break;
-      }
-
-      case "message_end": {
-        const usage = msg.usage as LifetimeUsage | undefined;
-        if (usage) {
-          options.onAssistantUsage?.({
-            input: usage.input,
-            output: usage.output,
-            cacheWrite: usage.cacheWrite ?? 0,
-            cost: usage.cost,
-          });
-        }
-        break;
-      }
-
-      case "compaction": {
-        options.onCompaction?.({
-          reason: (msg.reason as "manual" | "threshold" | "overflow") ?? "threshold",
-          tokensBefore: msg.tokensBefore ?? 0,
-        });
-        break;
-      }
-
-      case "completed": {
-        completed = true;
-        if (msg.result != null && msg.result !== "") {
-          responseText = msg.result as string;
-        }
-        break;
-      }
-
-      case "aborted": {
-        aborted = true;
-        completed = true;
-        break;
-      }
-
-      case "error": {
-        error = msg.message;
-        completed = true;
-        break;
-      }
-
-      default:
-        // Unknown message type — ignore
-        break;
     }
   }
 
@@ -443,15 +379,15 @@ export async function runViaUds(
   const childCompletionPromise = new Promise<UdsRunResult>((resolve) => {
     // Listen for child process exit (in case it exits without sending a message)
     const onExit = async () => {
-      if (!completed) {
-        completed = true;
+      if (!eventState.completed) {
+        eventState.completed = true;
         await cleanupSocket(socketPath);
       }
       resolve(buildResult());
     };
     child.once("exit", onExit);
     // If child already exited (race condition), trigger immediately
-    if (completed) { onExit(); }
+    if (eventState.completed) { onExit(); }
   });
 
   // Race: child completion vs. parent abort signal
@@ -467,7 +403,7 @@ export async function runViaUds(
       return;
     }
     options.signal.addEventListener("abort", () => {
-      aborted = true;
+      eventState.aborted = true;
       sendCommand({ type: "abort" });
     }, { once: true });
   });
@@ -481,7 +417,7 @@ export async function runViaUds(
   await cleanupSocket(socketPath);
 
   // If childCompletionPromise didn't already resolve, ensure it does
-  if (!completed) {
+  if (!eventState.completed) {
     await cleanupSocket(socketPath);
     await childExited; // destructuring { code, signal } unused here
     return buildResult();
@@ -493,11 +429,11 @@ export async function runViaUds(
 
   function buildResult(): UdsRunResult {
     return {
-      responseText: responseText.trim(),
+      responseText: eventState.responseText.trim(),
       session: null as unknown as AgentSession,
-      aborted,
+      aborted: eventState.aborted,
       steered: false,
-      failure: error,
+      failure: eventState.error,
       client,
       socketPath,
     };
@@ -585,12 +521,26 @@ export async function connectToUdsSocket(
   // ── 3. State variables ──────────────────────────────────────────────
   let buffer = "";
   let readyReceived = false;
-  let responseText = "";
-  let _turnCount = 0;
-  let _toolUses = 0;
-  let completed = false;
-  let aborted = false;
-  let error: string | undefined;
+
+  // ── 3.5 Event state and callbacks for handleChildEvent ────────────────
+  const cEventState: ChildEventState = {
+    responseText: "",
+    turnCount: 0,
+    completed: false,
+    aborted: false,
+    error: undefined,
+  };
+  const cEventCallbacks: ChildEventCallbacks = {
+    onTextDelta: options.onTextDelta,
+    onToolActivity: options.onToolActivity,
+    onAssistantUsage: options.onAssistantUsage,
+    onCompaction: options.onCompaction,
+  };
+
+  /** Handle events from child, mapping to options callbacks. */
+  function handleChildEventMsg(msg: ChildMessage): void {
+    handleChildEvent(msg, cEventCallbacks, cEventState);
+  }
 
   // ── 4. Data handler ─────────────────────────────────────────────────
   client.on("data", (data: Buffer) => {
@@ -604,7 +554,7 @@ export async function connectToUdsSocket(
           if (msg.type === "ready" && !readyReceived) {
             readyReceived = true;
           }
-          handleChildEvent(msg);
+          handleChildEventMsg(msg);
         } catch { /* skip malformed */ }
       }
     }
@@ -614,83 +564,6 @@ export async function connectToUdsSocket(
   function sendCommand(command: Record<string, unknown>): void {
     if (!client.destroyed && !client.writableEnded) {
       client.write(JSON.stringify(command) + "\n");
-    }
-  }
-
-  // ── 6. handleChildEvent ─────────────────────────────────────────────
-  function handleChildEvent(msg: ChildMessage): void {
-    switch (msg.type) {
-      case "turn_start": {
-        _turnCount++;
-        break;
-      }
-
-      case "turn_end": {
-        if (msg.turnCount != null) _turnCount = msg.turnCount;
-        break;
-      }
-
-      case "text_delta": {
-        responseText += msg.delta as string;
-        options.onTextDelta?.(msg.delta as string, responseText);
-        break;
-      }
-
-      case "tool_execution_start": {
-        _toolUses++;
-        options.onToolActivity?.({ type: "start", toolName: msg.toolName as string });
-        break;
-      }
-
-      case "tool_execution_end": {
-        options.onToolActivity?.({ type: "end", toolName: msg.toolName as string });
-        break;
-      }
-
-      case "message_end": {
-        const usage = msg.usage;
-        if (usage) {
-          options.onAssistantUsage?.({
-            input: usage.input,
-            output: usage.output,
-            cacheWrite: usage.cacheWrite ?? 0,
-            cost: usage.cost,
-          });
-        }
-        break;
-      }
-
-      case "compaction": {
-        options.onCompaction?.({
-          reason: (msg.reason as "manual" | "threshold" | "overflow") ?? "threshold",
-          tokensBefore: msg.tokensBefore ?? 0,
-        });
-        break;
-      }
-
-      case "completed": {
-        completed = true;
-        if (msg.result != null && msg.result !== "") {
-          responseText = msg.result as string;
-        }
-        break;
-      }
-
-      case "aborted": {
-        aborted = true;
-        completed = true;
-        break;
-      }
-
-      case "error": {
-        error = msg.message;
-        completed = true;
-        break;
-      }
-
-      default:
-        // Unknown message type — ignore
-        break;
     }
   }
 
@@ -742,7 +615,7 @@ export async function connectToUdsSocket(
       return;
     }
     options.signal.addEventListener("abort", () => {
-      aborted = true;
+      cEventState.aborted = true;
       sendCommand({ type: "abort" });
       resolve();
     }, { once: true });
@@ -751,7 +624,7 @@ export async function connectToUdsSocket(
   // ── 9. Completion polling (100ms interval on `completed` flag) ──────
   const completionPromise = new Promise<void>((resolve) => {
     const checkCompletion = setInterval(() => {
-      if (completed) {
+      if (cEventState.completed) {
         clearInterval(checkCompletion);
         resolve();
       }
@@ -766,43 +639,20 @@ export async function connectToUdsSocket(
   await cleanupSocket(socketPath);
 
   return {
-    responseText: responseText.trim(),
+    responseText: cEventState.responseText.trim(),
     session: null as unknown as AgentSession,
-    aborted,
+    aborted: cEventState.aborted,
     steered: false,
-    failure: error,
+    failure: cEventState.error,
     client,
     socketPath,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Child message types
+// Re-export ChildMessage from the shared handler module for external callers.
 // ---------------------------------------------------------------------------
-
-interface ChildMessage {
-  type:
-    | "ready"
-    | "turn_start"
-    | "turn_end"
-    | "text_delta"
-    | "tool_execution_start"
-    | "tool_execution_end"
-    | "message_start"
-    | "message_end"
-    | "compaction"
-    | "completed"
-    | "aborted"
-    | "error";
-  turnCount?: number;
-  delta?: string;
-  toolName?: string;
-  usage?: { input: number; output: number; cacheWrite?: number; cacheRead?: number; cost?: number };
-  reason?: "manual" | "threshold" | "overflow";
-  tokensBefore?: number;
-  result?: string;
-  message?: string;
-}
+export type { ChildMessage } from "./shared/handle-child-event.js";
 
 // ---------------------------------------------------------------------------
 // Exported helper functions
