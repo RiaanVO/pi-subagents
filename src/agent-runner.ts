@@ -149,7 +149,7 @@ export function extensionCanonicalName(extPath: string): string {
  *     stop before reading a consumer's or parent package's manifest.
  * The name is then taken only when that root's `pi.extensions` manifest actually
  * lists this entry. That "declares this entry" check is deliberate: our own test
- * fixtures live under this repo, whose root manifest declares `./src/index.ts`
+ * fixtures live under this repo, whose root manifest declares `./index.ts`
  * as `@tintinweb/pi-subagents`, so a looser rule would misattribute every
  * co-located file to `pi-subagents`.
  */
@@ -186,9 +186,10 @@ function extensionPackageName(extPath: string): string | undefined {
  * All names an extension answers to for allowlist matching (lowercased): its
  * path-derived {@link extensionCanonicalName} plus, when a pi package manifest
  * declares this entry, that package's unscoped short name (`@scope/foo` → `foo`).
- * #143: an extension installed via `pi.extensions: ["./src/index.ts"]` would
- * otherwise only ever match as `src` (the source directory), never by its
- * package name. The path-derived name is preserved, so it keeps matching too.
+ * #143: an extension installed via `pi.extensions: ["./index.ts"]` derives its
+ * canonical name from the package root (`pi-subagents`) rather than the source
+ * subdirectory (`src`). The path-derived name is preserved, so it keeps matching
+ * by both package name and path name.
  */
 export function extensionCanonicalNames(extPath: string): string[] {
   const canonical = extensionCanonicalName(extPath);

@@ -125,7 +125,7 @@ export async function runViaUds(
   // ─── 1.5 Ensure UDS server is compiled (auto-build if needed) ───────────
 
   // The child process imports `../dist/uds-server.js`. In production (after `npm
-  // run build`) this file exists. In development (running via `-e ./src/index.ts`
+  // run build`) this file exists. In development (running via `-e ./index.ts`
   // or from a pre-bundled extension) it may not — so we compile on demand.
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const projectRoot = join(moduleDir, "..");
