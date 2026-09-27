@@ -64,6 +64,7 @@ import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
 import { decideWorkflowCollision, FOREIGN_WORKFLOW_TOOL_NAMES } from "./workflow/collisions.js";
+import { resolveWorkflowCollisions as resolveWorkflowCollisionsCore } from "./workflow/collision-resolver.js";
 import { WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData } from "./workflow/entry.js";
 import { createWorkflowHost } from "./workflow/host.js";
 import { appendJournal, readJournal, type WorkflowJournalEntry } from "./workflow/journal.js";
@@ -2301,46 +2302,49 @@ Terse command-style prompts produce shallow, generic work.
    * Best-effort and swallowed. A diagnostic that took the session down would be
    * worse than the collision it reports.
    */
-  let collisionsChecked = false;
+  // collisionsChecked: one-shot guard — first call resolves, subsequent calls are no-ops.
+  const collisionsChecked: { value: boolean } = { value: false };
+  /**
+   * Act on {@link decideWorkflowCollision} — the half that needs the host.
+   *
+   * The policy (what counts as a conflict, what a pin changes, whether there is
+   * anything left to withdraw) lives in `workflow/collisions.ts` with the
+   * resolver shell in `workflow/collision-resolver.ts`.
+   *
+   * ## Why this can only happen at session_start
+   *
+   * `getAllTools` throws during extension loading ("Action methods cannot be
+   * called during extension loading"), and load order means a check at
+   * registration time could not see an extension that has not loaded yet. So
+   * the decision cannot gate `registerTool`; it has to undo it. `setActiveTools`
+   * is what makes that real rather than cosmetic — pi rebuilds the system
+   * prompt from the new set, and `session_start` runs before any turn, so the
+   * model never sees a spec we withdrew. A later `_refreshToolRegistry` keeps
+   * the active set it had and only adds names new to the registry, so ours does
+   * not creep back.
+   *
+   * Best-effort and swallowed. A diagnostic that took the session down would be
+   * worse than the collision it reports.
+   */
   function resolveWorkflowCollisions(ctx: ExtensionContext): void {
-    if (collisionsChecked) return;
-    collisionsChecked = true;
-
-    const warn = (message: string) => {
-      if (ctx.hasUI) ctx.ui.notify(message, "warning");
-      else console.warn(`[pi-subagents] ${message}`);
-    };
-
-    try {
-      if (!isWorkflowsEnabled()) return;
-
-      const verdict = decideWorkflowCollision({
-        tools: pi.getAllTools(),
-        // Identifies our own registration: this extension does not know its
-        // install path, and the description is the one field certainly ours.
-        ownDescription: workflowTool.description,
-        pinned: isWorkflowsPinned(),
-      });
-      if (verdict.kind === "none") return;
-      if (verdict.kind === "report") {
-        warn(verdict.message);
-        return;
-      }
-
-      workflowsEnabled = false; // not setWorkflowsEnabled: this is not the user pinning it
-      widget.update();
-      fleet.update();
-      warn(verdict.message);
-
-      if (!verdict.withdraw) return;
-      const active = pi.getActiveTools();
-      if (active.includes(SUBAGENT_TOOL_NAMES.WORKFLOW)) {
-        pi.setActiveTools(active.filter(name => name !== SUBAGENT_TOOL_NAMES.WORKFLOW));
-      }
-    } catch {
-      // getAllTools/setActiveTools are unavailable in some hosts (print mode,
-      // RPC). Not being able to check is not a reason to fail the session.
-    }
+    resolveWorkflowCollisionsCore({
+      collisionsCheckedRef: collisionsChecked,
+      isWorkflowsEnabled,
+      isWorkflowsPinned,
+      getAllTools: () => pi.getAllTools(),
+      ownDescription: workflowTool.description,
+      getActiveTools: () => pi.getActiveTools(),
+      setActiveTools: (tools) => pi.setActiveTools(tools),
+      warn: (message) => {
+        if (ctx.hasUI) ctx.ui.notify(message, "warning");
+        else console.warn(`[pi-subagents] ${message}`);
+      },
+      onStandDown: () => {
+        workflowsEnabled = false; // not setWorkflowsEnabled: this is not the user pinning it
+        widget.update();
+        fleet.update();
+      },
+    });
   }
 
   /**
